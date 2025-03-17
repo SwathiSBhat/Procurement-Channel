@@ -34,6 +34,7 @@ from bitcoin.core import (
     CTxInWitness,
     CScriptWitness,
     COIN,
+    Hash160,
 )
 from bitcoin.core import script
 from bitcoin.wallet import CBech32BitcoinAddress
@@ -135,7 +136,10 @@ class CtvTreePlan:
                  unvault_tx                        amount2
 (output1_pk OP_CHECKSIG && output2_pk OP_CHECKSIG)
               /               \
-        output1_tx           output2_tx            amount3
+        output1_tx          output2_tx            amount3
+    (A_pk OP_CHECKSIG)   (B_pk OP_CHECKSIG)
+              |               |
+        spending_tx1     spending_tx2             amount4
 
     """
 
@@ -143,6 +147,8 @@ class CtvTreePlan:
     hot_pubkey: S256Point
     cold_pubkey: S256Point
     fees_pubkey: S256Point
+    clientA_pubkey: S256Point
+    clientB_pubkey: S256Point
 
     # The coin being committed to the vault.
     coin_in: Coin
@@ -173,6 +179,10 @@ class CtvTreePlan:
 
         self.tohot_txid = get_txid(self.tohot_tx_unsigned)
         # self.tocold_txid = get_txid(self.tocold_tx_unsigned)
+        
+        # leaf outpoints
+        #self.leaf0_outpoint = COutPoint(txid_to_bytes(self.tohot_txid), 0)
+        #self.leaf1_outpoint = COutPoint(txid_to_bytes(self.tohot_txid), 1)
 
     def amount_at_step(self, step=0) -> Sats:
         """
@@ -290,11 +300,6 @@ class CtvTreePlan:
         return CScript(
             [
                 # fmt: off
-                # script.OP_DUP,
-                # script.OP_HASH160,
-                # self.hot_pubkey.hash160(),
-                # script.OP_EQUALVERIFY,
-                # script.OP_CHECKSIG,
                 self.hot_pubkey.sec(), script.OP_CHECKSIG
                 # fmt: on
             ]
@@ -305,12 +310,27 @@ class CtvTreePlan:
         return CScript(
             [
                 # fmt: off
-                # script.OP_DUP,
-                # script.OP_HASH160,
-                # self.cold_pubkey.hash160(),
-                # script.OP_EQUALVERIFY,
-                # script.OP_CHECKSIG,
                 self.cold_pubkey.sec(), script.OP_CHECKSIG
+                # fmt: on
+            ]
+        )
+        
+    @property
+    def unvault_redeemScript_A(self) -> CScript:
+        return CScript(
+            [
+                # fmt: off
+                self.clientA_pubkey.sec(), script.OP_CHECKSIG
+                # fmt: on
+            ]
+        )
+    
+    @property
+    def unvault_redeemScript_B(self) -> CScript:
+        return CScript(
+            [
+                # fmt: off
+                self.clientB_pubkey.sec(), script.OP_CHECKSIG
                 # fmt: on
             ]
         )
@@ -324,6 +344,95 @@ class CtvTreePlan:
     def sign_unvault_tx(self):
         # No signing necessary with a bare CTV output!
         return self.unvault_tx_unsigned
+    
+    
+    #@property
+    def get_children_spending_txn_unsigned(self, child_index: int, recipient_pubkey: S256Point) -> CMutableTransaction:
+        """
+        Return a transaction spending from the child output to a new address
+        """
+        global leaf_node_amount
+        
+        tx = p2wpkh_tx_template_single(
+                [BLANK_INPUT()],
+                leaf_node_amount - self.fees_per_step,
+                recipient_pubkey.hash160(),
+                self.fees_pubkey.hash160(),
+            )
+            
+        ctv_tx = self.tohot_txid
+        print(f"Spending output from tx: {ctv_tx}")
+        
+        tx.vin = [CTxIn(COutPoint(txid_to_bytes(ctv_tx), child_index), nSequence=self.block_delay)]
+        return tx
+    
+    def sign_spending_children_txn(self, child_index: int, spending_addr_privkey: PrivateKey, recipient_pubkey: S256Point) -> CTransaction:
+        """
+        Sign a transaction spending from the child output to a new address
+        """
+        tx = self.get_children_spending_txn_unsigned(child_index, recipient_pubkey)
+        if child_index == 0:
+            sighash = script.SignatureHash(
+                CScript([script.OP_0, spending_addr_privkey.point.hash160()]),
+                tx,
+                0,
+                script.SIGHASH_ALL,
+                amount=self.amount_at_step(2) // 2, # prior step amount
+                sigversion=script.SIGVERSION_WITNESS_V0,
+            )
+        else:
+            sighash = script.SignatureHash(
+                self.unvault_redeemScript_output2,
+                tx,
+                0,
+                script.SIGHASH_ALL,
+                amount=self.amount_at_step(2) // 2,
+                sigversion=script.SIGVERSION_WITNESS_V0,
+            )
+            
+        print(f"Output1 pub key: {self.hot_pubkey.sec(compressed=True).hex()}")
+        print(f"Output2 pub key: {self.cold_pubkey.sec(compressed=True).hex()}")
+        print(f"Output1 pubkey hash 160: {self.hot_pubkey.hash160().hex()}")
+        print(f"Output2 pubkey hash 160: {self.cold_pubkey.hash160().hex()}")
+        
+        print(f"Unvault Redeem Script 1: {self.unvault_redeemScript_output1.hex()}")
+        print(f"Unvault Redeem Script 2: {self.unvault_redeemScript_output2.hex()}")
+
+        expected_script_hash_1 = hashlib.sha256(self.unvault_redeemScript_output1).digest()
+        expected_script_hash_2 = hashlib.sha256(self.unvault_redeemScript_output2).digest()
+        print(f"Expected script hash (output1): {expected_script_hash_1.hex()}")
+        print(f"Expected script hash (output2): {expected_script_hash_2.hex()}")
+        
+        print(f"Amount at step 2: {self.amount_at_step(2) // 2}")
+        #print(f"Input amount: {tx.vin[0].prevout.nValue / COIN} BTC")
+        print(f"Output amount: {tx.vout[0].nValue / COIN} BTC")
+        print(f"Fee management output: {tx.vout[1].nValue / COIN} BTC")
+        
+        print(f"Spending address: {spending_addr_privkey.point.sec().hex()}")
+        print(f"Hot pubkey (used in script): {self.hot_pubkey.sec().hex()}")
+        print(f"Cold pubkey (used in script): {self.cold_pubkey.sec().hex()}")
+        print(f"Private key used for signing: {spending_addr_privkey.point.sec().hex()}")
+
+        pubkey_hash = spending_addr_privkey.point.hash160()
+        expected_pubkey_hash = bytes.fromhex("cc4eca2710f6f18b22b938ded027b9a313561ac9")  # From the scriptPubKey
+        assert pubkey_hash == expected_pubkey_hash, "Public key hash does not match scriptPubKey"
+        
+        sig = spending_addr_privkey.sign(int.from_bytes(sighash, "big")).der() + bytes(
+            [script.SIGHASH_ALL]
+        )
+        
+        if child_index == 0:
+            witness = CScriptWitness([sig, spending_addr_privkey.point.sec()])
+        else:
+            witness = CScriptWitness([sig, self.unvault_redeemScript_output2])
+
+        tx.wit = CTxWitness([CTxInWitness(witness)])
+        
+        print(f"Signature: {sig.hex()}")
+        print(f"Signature hash: {sighash.hex()}")
+        print(f"Witness: {witness}")
+        
+        return CTransaction.from_tx(tx)
     
     # uncumbering transaction
     # -------------------------------
@@ -413,6 +522,7 @@ class CtvTreePlan:
         # Create the witness for the transaction
         witness1 = CScriptWitness([sig1, self.unvault_redeemScript_output1])
         witness2 = CScriptWitness([sig2, self.unvault_redeemScript_output2])
+
         # Create the witness for the single input that will be split into two outputs
         #witness = CScriptWitness([sig1, self.unvault_redeemScript_output1, sig2, self.unvault_redeemScript_output2])
 
@@ -429,9 +539,34 @@ class CtvTreePlan:
         return CTransaction.from_tx(tx)
 
 
+def p2wpkh_tx_template_single(
+    vin: t.List[CTxIn], nValue: int, pay_to_h160: bytes, fee_mgmt_pay_to_h160: bytes
+) -> CMutableTransaction:
+    """Create a transaction template paying into a P2WPKH."""
+    pay_to_script = CScript([script.OP_0, pay_to_h160])
+    assert pay_to_script.is_witness_v0_keyhash()
+
+    pay_to_fee_script = CScript([script.OP_0, fee_mgmt_pay_to_h160])
+    assert pay_to_fee_script.is_witness_v0_keyhash()
+    HOPEFULLY_NOT_DUST: Sats = 550  # obviously TOOD?
+
+    tx = CMutableTransaction()
+    tx.nVersion = 2
+    tx.vin = vin
+    tx.vout = [
+        CTxOut(nValue, pay_to_script),
+        # Anchor output for CPFP-based fee bumps
+        CTxOut(HOPEFULLY_NOT_DUST, pay_to_fee_script),
+    ]
+    return tx
+
+# TODO: Move this elsewhere later
+leaf_node_amount = 0
+
 def p2wpkh_tx_template(
     vin: t.List[CTxIn], nValue: int, output1_pay_to_h160: bytes, output2_pay_to_h160: bytes, fee_mgmt_pay_to_h160: bytes
 ) -> CMutableTransaction:
+    global leaf_node_amount
     """Create a transaction template paying into a P2WPKH."""
     pay_to_script1 = CScript([script.OP_0, output1_pay_to_h160])
     assert pay_to_script1.is_witness_v0_keyhash()
@@ -444,6 +579,7 @@ def p2wpkh_tx_template(
     HOPEFULLY_NOT_DUST: Sats = 550  # obviously TOOD?
 
     half_value = nValue // 2 # Split the value between the two outputs
+    leaf_node_amount = half_value
 
     tx = CMutableTransaction()
     tx.nVersion = 2
@@ -535,6 +671,11 @@ class CtvTreeExecutor:
         print("Public key output2 (compressed):", output2_pubkey.sec(compressed=True).hex())
 
         (tx, _) = self._print_signed_tx(self.plan.sign_tohot_tx, output1_privkey, output2_privkey)
+        return tx
+    
+    def get_spending_children_txn(self, child_index: int, spending_addr_privkey: PrivateKey, recipient_pub_key: S256Point) -> CTransaction:
+        self.log(bold(f"# Spending from children output {child_index} to {spending_addr_privkey}"))
+        (tx, _) = self._print_signed_tx(self.plan.sign_spending_children_txn, child_index, spending_addr_privkey, recipient_pub_key)
         return tx
 
     def _print_signed_tx(
@@ -628,6 +769,8 @@ class CtvTreeScenario:
     fee_wallet: Wallet
     output1_wallet: Wallet
     output2_wallet: Wallet
+    A_wallet: Wallet
+    B_wallet: Wallet
     coin_in: Coin
 
     plan: CtvTreePlan
@@ -640,6 +783,10 @@ class CtvTreeScenario:
         fee_wallet = Wallet.generate(b"fee-" + seed)
         output2_wallet = Wallet.generate(b"output2-" + seed)
         output1_wallet = Wallet.generate(b"output1-" + seed)
+        # Client A wallet 
+        A_wallet = Wallet.generate(b"A-" + seed)
+        # Client B wallet
+        B_wallet = Wallet.generate(b"B-" + seed)
 
         rpc = BitcoinRPC(net_name=network)
         coin = coin or from_wallet.fund(rpc)
@@ -647,6 +794,8 @@ class CtvTreeScenario:
             output1_wallet.privkey.point,
             output2_wallet.privkey.point,
             fee_wallet.privkey.point,
+            A_wallet.privkey.point,
+            B_wallet.privkey.point,
             coin,
             **plan_kwargs,
         )
@@ -658,6 +807,8 @@ class CtvTreeScenario:
             fee_wallet=fee_wallet,
             output1_wallet=output1_wallet,
             output2_wallet=output2_wallet,
+            A_wallet=A_wallet,
+            B_wallet=B_wallet,
             coin_in=coin,
             plan=plan,
             exec=CtvTreeExecutor(plan, rpc, coin),
@@ -723,6 +874,90 @@ def to_children(original_coin_txid: TxidStr):
     tx = c.exec.get_tohot_tx(c.output1_wallet.privkey, c.output2_wallet.privkey)
     # Broadcast the tx that satisfies the CTV on the main chain.
     _broadcast_final(c, tx)
+    
+@cli.cmd
+def spend_children_outputs(original_coin_txid: TxidStr, child_index: int):
+    """
+    Spend the children output using a non-equivocating contract
+    to ensure it is spent just once
+    Use leaf index as context and serialized txid as statement
+    """
+    c = CtvTreeScenario.for_demo(original_coin_txid)
+    # ctv_tx = c.plan.tohot_txid
+    # print(f"Spending output from tx: {ctv_tx}")
+    # txn = c.rpc.getrawtransaction(ctv_tx, True)
+    
+    if child_index not in [0, 1]:
+        raise ValueError("child_output_index must be 0 or 1")
+    
+    # If child index is 0 spend to client A, otherwise spend to client B
+    if child_index == 0:
+        spending_priv_key = c.output1_wallet.privkey
+        recipient_pub_key = c.A_wallet.privkey.point
+    else:
+        spending_priv_key = c.output2_wallet.privkey
+        recipient_pub_key = c.B_wallet.privkey.point
+    spending_tx = c.exec.get_spending_children_txn(child_index, spending_priv_key, recipient_pub_key)
+    
+    # Broadcast the transaction
+    _broadcast_final(c, spending_tx)
+    
+    # child_output = txn["vout"][child_index]
+    # print(f"Child output being spent: {child_output}")
+    
+    # spending_tx = CMutableTransaction()
+    # spending_tx.nVersion = 2
+    # spending_tx.vin = [
+    #     CTxIn(COutPoint(txid_to_bytes(ctv_tx), child_index))
+    # ]
+    
+    # # Transfer to some new address
+    # new_wallet = Wallet.generate(b"{child_index}-spend")
+    # pay_to_script = CScript([script.OP_0, new_wallet.privkey.point.hash160()])
+    
+    # fee = 10000
+    # output_value = int(child_output["value"] * COIN) - fee
+    # spending_tx.vout = [CTxOut(output_value, pay_to_script)]
+    
+    # # Get the signing key for the input being spent
+    # if child_index == 0:
+    #     signing_key = c.output1_wallet.privkey
+    # else:
+    #     signing_key = c.output2_wallet.privkey
+    
+    # # Verify the public key hash matches the scriptPubKey
+    # pubkey_hash = signing_key.point.hash160()
+    # expected_pubkey_hash = bytes.fromhex(child_output["scriptPubKey"]["hex"])[2:]  # Skip OP_0 and OP_PUSHBYTES_20
+    # print(f"Pubkey hash: {pubkey_hash} and expected pubkey hash: {expected_pubkey_hash}")
+    # assert pubkey_hash == expected_pubkey_hash, "Public key hash does not match scriptPubKey"
+    
+    # # Compute the signature hash
+    # sighash = script.SignatureHash(
+    #     CScript([script.OP_0, pubkey_hash]),  # P2WPKH scriptPubKey
+    #     spending_tx,
+    #     0,  # Input index
+    #     script.SIGHASH_ALL,
+    #     amount=int(child_output["value"] * COIN),  # Amount of the input being spent
+    #     sigversion=script.SIGVERSION_WITNESS_V0,
+    # )
+    
+    # print(f"Sighash: {sighash.hex()}")
+    
+    # # Sign the sighash
+    # sig = signing_key.sign(int.from_bytes(sighash, "big")).der() + bytes([script.SIGHASH_ALL])
+    
+    # print(f"Signature: {sig.hex()}")
+    
+    # # Verify the signature
+    # sig_obj = Signature.parse(sig[:-1])  # Remove SIGHASH_ALL byte
+    # assert signing_key.point.verify(int.from_bytes(sighash, "big"), sig_obj), "Invalid signature"
+    
+    # # Construct the witness for P2WPKH
+    # witness = CScriptWitness([sig, signing_key.point.sec()])
+    # spending_tx.wit = CTxWitness([CTxInWitness(witness)])
+    
+    # print(f"Witness: {witness}")
+
 
 @cli.cmd
 def generate_blocks(n: int):
