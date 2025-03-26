@@ -42,7 +42,7 @@ from bitcoin.wallet import CBech32BitcoinAddress, CBitcoinSecret
 from buidl.hd import HDPrivateKey, PrivateKey
 from buidl.ecc import S256Point, Signature
 from rpc import BitcoinRPC, JSONRPCError
-from clii import App
+from clii import App, Arg
 from bitcoin import *
 from bitcoin.core import *
 
@@ -347,66 +347,6 @@ class CtvTreePlan:
         # No signing necessary with a bare CTV output!
         return self.unvault_tx_unsigned
     
-    
-    #@property
-    def get_children_spending_txn_unsigned(self, child_index: int, recipient_pubkey: S256Point) -> CMutableTransaction:
-        """
-        Return a transaction spending from the child output to a new address
-        """
-        global leaf_node_amount
-    
-        tx = p2wpkh_tx_template_single(
-                [BLANK_INPUT()],
-                leaf_node_amount - self.fees_per_step,
-                recipient_pubkey.hash160(),
-                self.fees_pubkey.hash160(),
-            )
-            
-        ctv_tx = self.tohot_txid
-        print(f"Spending output from tx: {ctv_tx}")
-        
-        tx.vin = [CTxIn(COutPoint(txid_to_bytes(ctv_tx), child_index), nSequence=self.block_delay)]
-        return tx
-    
-    def sign_spending_children_txn(self, child_index: int, spending_addr_privkey: PrivateKey, recipient_pubkey: S256Point) -> CTransaction:
-        """
-        Sign a transaction spending from the child output to a new address
-        """
-        tx = self.get_children_spending_txn_unsigned(child_index, recipient_pubkey)
-
-        # Verify public key hash
-        pubkey_hash = spending_addr_privkey.point.hash160()
-        expected_pubkey_hash = bytes.fromhex("cc4eca2710f6f18b22b938ded027b9a313561ac9")  # From the scriptPubKey
-        assert pubkey_hash == expected_pubkey_hash, "Public key hash does not match scriptPubKey"
-
-        # Compute the sighash
-        sighash = script.SignatureHash(
-            CScript([script.OP_0, spending_addr_privkey.point.hash160()]),
-            tx,
-            0,
-            script.SIGHASH_ALL,
-            amount=self.amount_at_step(2) // 2,  # Ensure this matches the UTXO value
-            sigversion=script.SIGVERSION_WITNESS_V0,
-        )
-        print(f"Sighash: {sighash.hex()}")
-
-        # Sign the sighash
-        sig = spending_addr_privkey.sign(int.from_bytes(sighash, "big")).der() + bytes([script.SIGHASH_ALL])
-        print(f"Signature: {sig.hex()}")
-
-        # Verify the signature
-        sig_obj = Signature.parse(sig[:-1])  # Remove SIGHASH_ALL byte
-        assert spending_addr_privkey.point.verify(int.from_bytes(sighash, "big"), sig_obj), "Invalid signature"
-
-        # Construct the witness (for P2WPKH)
-        witness = CScriptWitness([sig, spending_addr_privkey.point.sec()])
-        print(f"Witness: {witness}")
-
-        # Add the witness to the transaction
-        tx.wit = CTxWitness([CTxInWitness(witness)])
-
-        return CTransaction.from_tx(tx)
-    
     # uncumbering transaction
     # -------------------------------
 
@@ -511,27 +451,6 @@ class CtvTreePlan:
 
         return CTransaction.from_tx(tx)
 
-
-def p2wpkh_tx_template_single(
-    vin: t.List[CTxIn], nValue: int, pay_to_h160: bytes, fee_mgmt_pay_to_h160: bytes
-) -> CMutableTransaction:
-    """Create a transaction template paying into a P2WPKH."""
-    pay_to_script = CScript([script.OP_0, pay_to_h160])
-    assert pay_to_script.is_witness_v0_keyhash()
-
-    pay_to_fee_script = CScript([script.OP_0, fee_mgmt_pay_to_h160])
-    assert pay_to_fee_script.is_witness_v0_keyhash()
-    HOPEFULLY_NOT_DUST: Sats = 550  # obviously TOOD?
-
-    tx = CMutableTransaction()
-    tx.nVersion = 2
-    tx.vin = vin
-    tx.vout = [
-        CTxOut(nValue, pay_to_script),
-        # Anchor output for CPFP-based fee bumps
-        CTxOut(HOPEFULLY_NOT_DUST, pay_to_fee_script),
-    ]
-    return tx
 
 # TODO: Move this elsewhere later
 leaf_node_amount = 0
@@ -644,11 +563,6 @@ class CtvTreeExecutor:
         print("Public key output2 (compressed):", output2_pubkey.sec(compressed=True).hex())
 
         (tx, _) = self._print_signed_tx(self.plan.sign_tohot_tx, output1_privkey, output2_privkey)
-        return tx
-    
-    def get_spending_children_txn(self, child_index: int, spending_addr_privkey: PrivateKey, recipient_pub_key: S256Point) -> CTransaction:
-        self.log(bold(f"# Spending from children output {child_index} to {recipient_pub_key.address()}"))
-        (tx, _) = self._print_signed_tx(self.plan.sign_spending_children_txn, child_index, spending_addr_privkey, recipient_pub_key)
         return tx
 
     def _print_signed_tx(
@@ -798,15 +712,12 @@ class CtvTreeScenario:
             # We're resuming a vault
             rpc = BitcoinRPC(net_name="regtest")
             coin_in = Coin.from_txid(original_coin_txid, 0, rpc)
-            print(f"Resuming with coin of value: {coin_in.amount}")
 
         # TODO - Check blockdelay
         c = CtvTreeScenario.from_network(
             "regtest", seed=b"demo", coin=coin_in, block_delay=0
         )
-
         c.exec.log = lambda *args, **kwargs: print(*args, file=sys.stderr, **kwargs)
-
         return c
 
 
@@ -837,7 +748,6 @@ def unencumber(original_coin_txid: TxidStr):
     c = CtvTreeScenario.for_demo(original_coin_txid)
     c.exec.start_unvault()
 
-
 @cli.cmd
 def to_children(original_coin_txid: TxidStr):
     """
@@ -849,34 +759,38 @@ def to_children(original_coin_txid: TxidStr):
     _broadcast_final(c, tx)
 
 @cli.cmd
-def spend_children_outputs1(original_coin_txid: TxidStr, child_index: int = 0):
+def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
+    """
+    Spend the output in leaf nodes to the respective recipients 
+    Currently, the tree has just 2 leaves => index 0 or 1
+    If index = 0 => spend to A's wallet
+    If index = 1 => spend to B's wallet
+    """
+    if leaf_index not in [0, 1]:
+        print("Invalid leaf index. Must be 0 or 1")
+        sys.exit(1)
+    
     c = CtvTreeScenario.for_demo(original_coin_txid)
     
-    # 1. VERIFIED: We know the private key matches the UTXO address
-    spending_wallet = c.output1_wallet if child_index == 0 else c.output2_wallet
-    utxo_address = "bcrt1qe38v5fcs7mcckg4e8r0dqfae5vf4vxkfft2u7d"
-    assert spending_wallet.privkey.point.p2wpkh_address(network="regtest") == utxo_address
+    # Set spend address based on leaf index (0 or 1)
+    spending_wallet = c.output1_wallet if leaf_index == 0 else c.output2_wallet
+    # Set recipient address based on leaf index (0 or 1)
+    recipient_pubkey = c.A_wallet.privkey.point if leaf_index == 0 else c.B_wallet.privkey.point
     
     ctv_tx = c.plan.tohot_txid
     print(f"Spending output from tx: {ctv_tx}")
-    # 2. Create the most basic possible transaction
+
     tx = CMutableTransaction()
     tx.nVersion = 2
-    # tx.vin = [CTxIn(
-    #     COutPoint(txid_to_bytes("8cd6095bf1e891de227929991b24ccdfb078493622449a8ae7a4a174d70424fc"), 
-    #     child_index),
-    #     nSequence=0
-    # )]
-    tx.vin = [CTxIn(COutPoint(txid_to_bytes(ctv_tx), child_index), nSequence=0)]
+    tx.vin = [CTxIn(COutPoint(txid_to_bytes(ctv_tx), leaf_index), nSequence=0)]
     
-    # Single output sending back to ourselves minus fee
-    # tx.vout = [CTxOut(
-    #     2499985000 - 10000,  # 10000 sat fee
-    #     CScript([script.OP_0, spending_wallet.privkey.point.hash160()])
-    # )]
-    tx.vout = [CTxOut(2499985000 - 10000, CScript([script.OP_0, c.A_wallet.privkey.point.hash160()]))]
+    # Output sending to A's wallet
+    ctv_raw_tx = c.rpc.getrawtransaction(ctv_tx, True)
+    input_amount = int(ctv_raw_tx["vout"][leaf_index]["value"] * COIN)
+    # Output = input - fees (10000 sats)
+    tx.vout = [CTxOut(input_amount - 10000, CScript([script.OP_0, recipient_pubkey.hash160()]))]
     
-    # 3. Generate signature THE EXACT WAY bitcoin-core would
+    # Generate signature for P2WPKH
     script_code = CScript([script.OP_DUP, script.OP_HASH160, 
                           spending_wallet.privkey.point.hash160(), 
                           script.OP_EQUALVERIFY, script.OP_CHECKSIG])
@@ -886,138 +800,16 @@ def spend_children_outputs1(original_coin_txid: TxidStr, child_index: int = 0):
         tx,
         0,
         script.SIGHASH_ALL,
-        amount=2499985000,
+        amount=input_amount,
         sigversion=script.SIGVERSION_WITNESS_V0,
     )
     
     sig = spending_wallet.privkey.sign(int.from_bytes(sighash, 'big')).der() + bytes([script.SIGHASH_ALL])
     
-    # 4. Witness must be EXACTLY [signature, pubkey] for P2WPKH
+    # Witness must be EXACTLY [signature, pubkey] for P2WPKH
     tx.wit = CTxWitness([CTxInWitness(CScriptWitness([sig, spending_wallet.privkey.point.sec()]))])
     
-    # 5. Final verification
-    raw_tx = tx.serialize().hex()
-    print(f"Final raw transaction:\n{raw_tx}")
-    
-    # 6. Try broadcasting through both methods
-    try:
-        # Method 1: Direct RPC
-        txid = c.rpc.sendrawtransaction(raw_tx)
-        print(f"✓ Success! TXID: {txid}")
-        return tx
-    except JSONRPCError as e:
-        print(f"Direct broadcast failed: {e}")
-        
-        # Method 2: Through bitcoin-cli
-        import subprocess
-        try:
-            cli_result = subprocess.run(
-                ["bitcoin-cli", "-regtest", "sendrawtransaction", raw_tx],
-                capture_output=True,
-                text=True
-            )
-            if cli_result.returncode == 0:
-                print(f"✓ Success via bitcoin-cli! TXID: {cli_result.stdout.strip()}")
-            else:
-                print(f"bitcoin-cli error:\n{cli_result.stderr}")
-        except Exception as cli_e:
-            print(f"bitcoin-cli failed: {cli_e}")
-        
-        # Final fallback - decode and analyze
-        print("\nFALLBACK ANALYSIS:")
-        decode_result = c.rpc.decoderawtransaction(raw_tx)
-        print("Decoded transaction:")
-        pprint.pprint(decode_result)
-        
-        print("\nTry manually with:")
-        print(f"bitcoin-cli -regtest decoderawtransaction '{raw_tx}'")
-        print(f"bitcoin-cli -regtest signrawtransactionwithwallet '{raw_tx}'")
-        
-        raise RuntimeError("All broadcast attempts failed")
-    
-@cli.cmd
-def spend_children_outputs(original_coin_txid: TxidStr, child_index: int):
-    """
-    Spend the children output using a non-equivocating contract
-    to ensure it is spent just once
-    Use leaf index as context and serialized txid as statement
-    """
-    c = CtvTreeScenario.for_demo(original_coin_txid)
-    # ctv_tx = c.plan.tohot_txid
-    # print(f"Spending output from tx: {ctv_tx}")
-    # txn = c.rpc.getrawtransaction(ctv_tx, True)
-    
-    if child_index not in [0, 1]:
-        raise ValueError("child_output_index must be 0 or 1")
-    
-    # If child index is 0 spend to client A, otherwise spend to client B
-    if child_index == 0:
-        spending_priv_key = c.output1_wallet.privkey
-        recipient_pub_key = c.A_wallet.privkey.point
-    else:
-        spending_priv_key = c.output2_wallet.privkey
-        recipient_pub_key = c.B_wallet.privkey.point
-    spending_tx = c.exec.get_spending_children_txn(child_index, spending_priv_key, recipient_pub_key)
-    
-    # Broadcast the transaction
-    _broadcast_final(c, spending_tx)
-    
-    # child_output = txn["vout"][child_index]
-    # print(f"Child output being spent: {child_output}")
-    
-    # spending_tx = CMutableTransaction()
-    # spending_tx.nVersion = 2
-    # spending_tx.vin = [
-    #     CTxIn(COutPoint(txid_to_bytes(ctv_tx), child_index))
-    # ]
-    
-    # # Transfer to some new address
-    # new_wallet = Wallet.generate(b"{child_index}-spend")
-    # pay_to_script = CScript([script.OP_0, new_wallet.privkey.point.hash160()])
-    
-    # fee = 10000
-    # output_value = int(child_output["value"] * COIN) - fee
-    # spending_tx.vout = [CTxOut(output_value, pay_to_script)]
-    
-    # # Get the signing key for the input being spent
-    # if child_index == 0:
-    #     signing_key = c.output1_wallet.privkey
-    # else:
-    #     signing_key = c.output2_wallet.privkey
-    
-    # # Verify the public key hash matches the scriptPubKey
-    # pubkey_hash = signing_key.point.hash160()
-    # expected_pubkey_hash = bytes.fromhex(child_output["scriptPubKey"]["hex"])[2:]  # Skip OP_0 and OP_PUSHBYTES_20
-    # print(f"Pubkey hash: {pubkey_hash} and expected pubkey hash: {expected_pubkey_hash}")
-    # assert pubkey_hash == expected_pubkey_hash, "Public key hash does not match scriptPubKey"
-    
-    # # Compute the signature hash
-    # sighash = script.SignatureHash(
-    #     CScript([script.OP_0, pubkey_hash]),  # P2WPKH scriptPubKey
-    #     spending_tx,
-    #     0,  # Input index
-    #     script.SIGHASH_ALL,
-    #     amount=int(child_output["value"] * COIN),  # Amount of the input being spent
-    #     sigversion=script.SIGVERSION_WITNESS_V0,
-    # )
-    
-    # print(f"Sighash: {sighash.hex()}")
-    
-    # # Sign the sighash
-    # sig = signing_key.sign(int.from_bytes(sighash, "big")).der() + bytes([script.SIGHASH_ALL])
-    
-    # print(f"Signature: {sig.hex()}")
-    
-    # # Verify the signature
-    # sig_obj = Signature.parse(sig[:-1])  # Remove SIGHASH_ALL byte
-    # assert signing_key.point.verify(int.from_bytes(sighash, "big"), sig_obj), "Invalid signature"
-    
-    # # Construct the witness for P2WPKH
-    # witness = CScriptWitness([sig, signing_key.point.sec()])
-    # spending_tx.wit = CTxWitness([CTxInWitness(witness)])
-    
-    # print(f"Witness: {witness}")
-
+    _broadcast_final(c, tx)
 
 @cli.cmd
 def generate_blocks(n: int):
@@ -1026,15 +818,14 @@ def generate_blocks(n: int):
 
 def _broadcast_final(c: CtvTreeScenario, tx: CTransaction):
     print()
-    title = f"spending to {red('children')}"
 
-    if input(f"Broadcast transaction {title}? (y/n) ") == 'y':
+    if input(f"Broadcast transaction? (y/n) ") == 'y':
         try:
-            print(f"tx details: {tx}")
+            print(f"Transaction to broadcast: {blue(tx)}")
             txid = c.rpc.sendrawtransaction(tx.serialize().hex())
         except JSONRPCError as e:
             if 'missingorspent' in e.msg:
-                print("!!! can't broadcast - unvault txn hasn't been seen yet")
+                print("!!! can't broadcast - txn hasn't been seen yet")
                 sys.exit(3)
             else:
                 raise
