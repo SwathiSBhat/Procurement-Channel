@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-Implementation of a simple OP_CTV transaction that splits the input
-into two halves to give a tree-like structure.
-
-          output you're spending from
-                     |
-             tovault_tx output
-                (<H> OP_CTV)
-                     |
-                 unvault_tx
-    (output1_pk OP_CHECKSIG | output2_pk OP_CHECKSIG)
-              /               \
-        output1_tx           output2_tx
-"""
-
-import struct
-import hashlib
 import sys
 import pprint
 import typing as t
@@ -40,22 +22,24 @@ from bitcoin.wallet import CBech32BitcoinAddress
 from buidl.hd import HDPrivateKey, PrivateKey
 from buidl.ecc import S256Point, Signature
 from rpc import BitcoinRPC, JSONRPCError
-from clii import App
-
-cli = App(usage=__doc__)
-
-OP_CHECKTEMPLATEVERIFY = script.OP_NOP4
-
-Sats = int
-SatsPerByte = int
-
-TxidStr = str
-Txid = str
-RawTxStr = str
+from utils import ( 
+    scan_utxos, 
+    txid_to_bytes, 
+    bytes_to_txid,
+    get_standard_template_hash,
+    p2wpkh_tx_template,
+    sha256,
+    no_output,
+    bold,
+    yellow,
+    green,
+    blue,
+)
+from constants import Sats, TxidStr, RawTxStr
 
 # For use with template transactions.
 BLANK_INPUT = CMutableTxIn
-
+OP_CHECKTEMPLATEVERIFY = script.OP_NOP4
 
 @dataclass(frozen=True)
 class Coin:
@@ -442,70 +426,7 @@ class CtvTreePlan:
         return CTransaction.from_tx(tx)
 
 
-# TODO: Move this elsewhere later
-leaf_node_amount = 0
-
-def p2wpkh_tx_template(
-    vin: t.List[CTxIn], nValue: int, output1_pay_to_h160: bytes, output2_pay_to_h160: bytes, fee_mgmt_pay_to_h160: bytes
-) -> CMutableTransaction:
-    global leaf_node_amount
-    """Create a transaction template paying into a P2WPKH."""
-    pay_to_script1 = CScript([script.OP_0, output1_pay_to_h160])
-    assert pay_to_script1.is_witness_v0_keyhash()
-
-    pay_to_script2 = CScript([script.OP_0, output2_pay_to_h160])
-    assert pay_to_script2.is_witness_v0_keyhash()
-
-    pay_to_fee_script = CScript([script.OP_0, fee_mgmt_pay_to_h160])
-    assert pay_to_fee_script.is_witness_v0_keyhash()
-    HOPEFULLY_NOT_DUST: Sats = 550  # obviously TOOD?
-
-    half_value = nValue // 2 # Split the value between the two outputs
-    leaf_node_amount = half_value
-
-    tx = CMutableTransaction()
-    tx.nVersion = 2
-    tx.vin = vin
-    tx.vout = [
-        CTxOut(half_value, pay_to_script1),
-        CTxOut(half_value, pay_to_script2),
-        # Anchor output for CPFP-based fee bumps
-        CTxOut(HOPEFULLY_NOT_DUST, pay_to_fee_script),
-    ]
-    return tx
-
-def make_color(start, end: str) -> t.Callable[[str], str]:
-    def color_func(s: str) -> str:
-        return start + t_(s) + end
-
-    return color_func
-
-
-def esc(*codes: t.Union[int, str]) -> str:
-    """
-    Produces an ANSI escape code from a list of integers
-    """
-    return t_("\x1b[{}m").format(t_(";").join(t_(str(c)) for c in codes))
-
-
-def t_(b: t.Union[bytes, t.Any]) -> str:
-    """ensure text type"""
-    if isinstance(b, bytes):
-        return b.decode()
-    return b
-
-
-FG_END = esc(39)
-red = make_color(esc(31), FG_END)
-green = make_color(esc(32), FG_END)
-yellow = make_color(esc(33), FG_END)
-blue = make_color(esc(34), FG_END)
-cyan = make_color(esc(36), FG_END)
-bold = make_color(esc(1), esc(22))
-
-def no_output(*args, **kwargs):
-    pass
-
+        
 @dataclass
 class CtvTreeExecutor:
     plan: CtvTreePlan
@@ -570,71 +491,6 @@ class CtvTreeExecutor:
 
         return tx, hx
     
-def generateblocks(rpc: BitcoinRPC, n: int = 1, addr: str = None) -> t.List[str]:
-    if not addr:
-        addr = (
-            HDPrivateKey.from_seed(b"yaddayah")
-            .get_private_key(1)
-            .point.p2wpkh_address(network=rpc.net_name)
-        )
-    return rpc.generatetoaddress(n, addr)
-
-
-def sha256(s) -> bytes:
-    return hashlib.sha256(s).digest()
-
-
-def ser_compact_size(l) -> bytes:
-    r = b""
-    if l < 253:
-        r = struct.pack("B", l)
-    elif l < 0x10000:
-        r = struct.pack("<BH", 253, l)
-    elif l < 0x100000000:
-        r = struct.pack("<BI", 254, l)
-    else:
-        r = struct.pack("<BQ", 255, l)
-    return r
-
-
-def ser_string(s) -> bytes:
-    return ser_compact_size(len(s)) + s
-
-
-def get_standard_template_hash(tx: CTransaction, nIn: int) -> bytes:
-    r = b""
-    r += struct.pack("<i", tx.nVersion)
-    r += struct.pack("<I", tx.nLockTime)
-    vin = tx.vin or []
-    vout = tx.vout or []
-    if any(inp.scriptSig for inp in vin):
-        r += sha256(b"".join(ser_string(inp.scriptSig) for inp in vin))
-    r += struct.pack("<I", len(tx.vin))
-    r += sha256(b"".join(struct.pack("<I", inp.nSequence) for inp in vin))
-    r += struct.pack("<I", len(tx.vout))
-    r += sha256(b"".join(out.serialize() for out in vout))
-    r += struct.pack("<I", nIn)
-    return sha256(r)
-
-
-def txid_to_bytes(txid: str) -> bytes:
-    """Convert the txids output by Bitcoin Core (little endian) to bytes."""
-    return bytes.fromhex(txid)[::-1]
-
-
-def bytes_to_txid(b: bytes) -> str:
-    """Convert big-endian bytes to Core-style txid str."""
-    return b[::-1].hex()
-
-
-def to_outpoint(txid: TxidStr, n: int) -> COutPoint:
-    return COutPoint(txid_to_bytes(txid), n)
-
-
-def scan_utxos(rpc, addr):
-    return rpc.scantxoutset("start", [f"addr({addr})"])
-
-
 @dataclass
 class CtvTreeScenario:
     """Instantiate everything needed to do vault operations."""
@@ -710,108 +566,12 @@ class CtvTreeScenario:
         c.exec.log = lambda *args, **kwargs: print(*args, file=sys.stderr, **kwargs)
         return c
 
-
-@cli.cmd
-def encumber():
-    """
-    Returns the txid of the coin spent into the CTV, which is used to resume CTV
-    operations.
-    """
-    c = CtvTreeScenario.for_demo()
-    c.exec.send_to_vault(c.coin_in, c.from_wallet.privkey)
-    # TODO - Uncomment this later
-    # assert not c.exec.search_for_unvault()
-    original_coin_txid = c.coin_in.outpoint.hash[::-1].hex()
-    print(original_coin_txid)
-
-@cli.cmd
-def unencumber(original_coin_txid: TxidStr):
-    """
-    Start the unvault process with an existing vault, based on the orignal coin
-    input.
-
-    We assume the original coin has a vout index of 0.
-
-    Args:
-        original_coin_txid: the txid of the original coin we spent into the vault.
-    """
-    c = CtvTreeScenario.for_demo(original_coin_txid)
-    c.exec.start_unvault()
-
-@cli.cmd
-def to_children(original_coin_txid: TxidStr):
-    """
-    Spend the vaulted coin to the two children outputs.
-    """
-    c = CtvTreeScenario.for_demo(original_coin_txid)
-    tx = c.exec.get_tohot_tx(c.output1_wallet.privkey, c.output2_wallet.privkey)
-    # Broadcast the tx that satisfies the CTV on the main chain.
-    _broadcast_final(c, tx)
-
-@cli.cmd
-def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
-    """
-    Spend the output in leaf nodes to the respective recipients 
-    Currently, the tree has just 2 leaves => index 0 or 1
-    If index = 0 => spend to A's wallet
-    If index = 1 => spend to B's wallet
-    """
-    if leaf_index not in [0, 1]:
-        print("Invalid leaf index. Must be 0 or 1")
-        sys.exit(1)
-    
-    c = CtvTreeScenario.for_demo(original_coin_txid)
-    
-    # Set spend address based on leaf index (0 or 1)
-    spending_wallet = c.output1_wallet if leaf_index == 0 else c.output2_wallet
-    # Set recipient address based on leaf index (0 or 1)
-    recipient_pubkey = c.A_wallet.privkey.point if leaf_index == 0 else c.B_wallet.privkey.point
-    
-    ctv_tx = c.plan.tohot_txid
-    print(f"Spending output from tx: {ctv_tx}")
-
-    tx = CMutableTransaction()
-    tx.nVersion = 2
-    tx.vin = [CTxIn(COutPoint(txid_to_bytes(ctv_tx), leaf_index), nSequence=0)]
-    
-    # Output sending to A's wallet
-    ctv_raw_tx = c.rpc.getrawtransaction(ctv_tx, True)
-    input_amount = int(ctv_raw_tx["vout"][leaf_index]["value"] * COIN)
-    # Output = input - fees (10000 sats)
-    tx.vout = [CTxOut(input_amount - 10000, CScript([script.OP_0, recipient_pubkey.hash160()]))]
-    
-    # Generate signature for P2WPKH
-    script_code = CScript([script.OP_DUP, script.OP_HASH160, 
-                          spending_wallet.privkey.point.hash160(), 
-                          script.OP_EQUALVERIFY, script.OP_CHECKSIG])
-    
-    sighash = script.SignatureHash(
-        script_code,
-        tx,
-        0,
-        script.SIGHASH_ALL,
-        amount=input_amount,
-        sigversion=script.SIGVERSION_WITNESS_V0,
-    )
-    
-    sig = spending_wallet.privkey.sign(int.from_bytes(sighash, 'big')).der() + bytes([script.SIGHASH_ALL])
-    
-    # Witness must be EXACTLY [signature, pubkey] for P2WPKH
-    tx.wit = CTxWitness([CTxInWitness(CScriptWitness([sig, spending_wallet.privkey.point.sec()]))])
-    
-    _broadcast_final(c, tx)
-
-@cli.cmd
-def generate_blocks(n: int):
-    rpc = BitcoinRPC(net_name="regtest")
-    pprint.pprint(generateblocks(rpc, n))
-
 def _broadcast_final(c: CtvTreeScenario, tx: CTransaction):
     print()
 
     if input(f"Broadcast transaction? (y/n) ") == 'y':
         try:
-            print(f"Transaction to broadcast: {blue(tx)}")
+            print(f"Transaction to broadcast: {tx}")
             txid = c.rpc.sendrawtransaction(tx.serialize().hex())
         except JSONRPCError as e:
             if 'missingorspent' in e.msg:
@@ -823,6 +583,3 @@ def _broadcast_final(c: CtvTreeScenario, tx: CTransaction):
         print(f"Broadcast done: {green(txid)}")
         print()
         pprint.pprint(c.rpc.gettxout(txid, 0))
-
-if __name__ == "__main__":
-    cli.run()
