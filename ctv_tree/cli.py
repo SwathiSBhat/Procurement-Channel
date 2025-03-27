@@ -42,7 +42,11 @@ def encumber():
     
     print(bold("# Creating transaction to penalize equivocation\n"))
     # TODO - Create transaction to penalize equivocation
-    #c.exec.init_penalizing_tx(c.from_wallet.privkey)
+    c.exec.init_penalizing_tx(c.from_wallet.privkey)
+    
+    # Mine blocks to confirm the penalizing tx
+    rpc = BitcoinRPC(net_name="regtest")
+    generateblocks(rpc, 10)
     
     c.exec.send_to_vault(c.coin_in, c.from_wallet.privkey)
     # TODO - Uncomment this later

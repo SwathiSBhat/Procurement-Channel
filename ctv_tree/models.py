@@ -69,9 +69,12 @@ class Coin:
 
 @dataclass
 class Wallet:
-    privkey: PrivateKey
-    coins: t.List[Coin]
-    network: str
+    def __init__(self, privkey, coins, network):
+        self.privkey = privkey
+        self.network = network
+        self._unspent_coins = coins.copy()  # Track unspent separately
+        self._spent_outpoints = set()  # Track spent UTXOs
+
 
     @classmethod
     def generate(cls, seed: bytes, network: str = "regtest") -> "Wallet":
@@ -82,33 +85,38 @@ class Wallet:
         )
 
     def fund(self, rpc: BitcoinRPC, blocks_to_mine: int = 110) -> Coin:
-        fund_addr = self.privkey.point.p2wpkh_address(network=self.network)
-        rpc.generatetoaddress(blocks_to_mine, fund_addr)
-
-        scan = scan_utxos(rpc, fund_addr)
-        assert scan["success"]
-
-        for utxo in scan["unspents"]:
-            self.coins.append(
+        self._unspent_coins = [
+            c for c in self._unspent_coins 
+            if c.outpoint not in self._spent_outpoints
+        ]
+        
+        if not self._unspent_coins:
+            # Mine fresh coins if none available
+            fund_addr = self.privkey.point.p2wpkh_address(network=self.network)
+            rpc.generatetoaddress(blocks_to_mine, fund_addr)
+            
+            # Rescan to get ALL current UTXOs
+            scan = scan_utxos(rpc, fund_addr)
+            assert scan["success"]
+            
+            self._unspent_coins = [
                 Coin(
                     COutPoint(txid_to_bytes(utxo["txid"]), utxo["vout"]),
                     int(utxo["amount"] * COIN),
                     bytes.fromhex(utxo["scriptPubKey"]),
                     utxo["height"],
                 )
-            )
-
-        # Earliest coins first.
-        self.coins = [
-            c for c in sorted(self.coins, key=lambda i: i.height) if c.amount > COIN
-        ]
-        try:
-            return self.coins.pop(0)
-        except IndexError:
-            raise RuntimeError(
-                "Your regtest is out of subsidy - "
-                "please wipe the datadir and restart."
-            )
+                for utxo in scan["unspents"]
+                if COutPoint(txid_to_bytes(utxo["txid"]), utxo["vout"]) not in self._spent_outpoints
+            ]
+            
+        if not self._unspent_coins:
+            raise RuntimeError("No spendable coins after funding")
+            
+        # Return oldest unspent coin
+        coin = min(self._unspent_coins, key=lambda c: c.height)
+        self._spent_outpoints.add(coin.outpoint)
+        return coin
         
 @dataclass
 class CtvTreePlan:
