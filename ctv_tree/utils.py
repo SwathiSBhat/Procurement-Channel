@@ -1,8 +1,6 @@
 import struct
 import hashlib
-from rpc import BitcoinRPC, JSONRPCError
-import sys
-import pprint
+from rpc import BitcoinRPC
 from buidl.hd import HDPrivateKey
 from bitcoin.core import (
     CTransaction,
@@ -14,7 +12,10 @@ from bitcoin.core import (
 )
 import typing as t
 from bitcoin.core import script
-from constants import Sats, TxidStr
+from constants import Sats, TxidStr, EQUIVOCATION_STATE_FILE, PENALIZING_TXID_FILE
+import json
+import base64
+from typing import Dict
 
 def generateblocks(rpc: BitcoinRPC, n: int = 1, addr: str = None) -> t.List[str]:
     if not addr:
@@ -80,7 +81,6 @@ def to_outpoint(txid: TxidStr, n: int) -> COutPoint:
 def scan_utxos(rpc, addr):
     return rpc.scantxoutset("start", [f"addr({addr})"])
 
-# TODO: Move this elsewhere later
 leaf_node_amount = 0
 
 def p2wpkh_tx_template(
@@ -143,3 +143,46 @@ bold = make_color(esc(1), esc(22))
 
 def no_output(*args, **kwargs):
     pass
+
+def save_equivocation_state(state: Dict[str, bytes]) -> None:
+    """Save dict with string keys and bytes values to JSON file."""
+    with open(EQUIVOCATION_STATE_FILE, "w") as f:
+        json.dump(
+            {k: base64.b64encode(v).decode('utf-8') for k, v in state.items()},
+            f,
+            indent=2
+        )
+
+def load_equivocation_state() -> Dict[str, bytes]:
+    """Load dict with string keys and bytes values from JSON file."""
+    if not EQUIVOCATION_STATE_FILE.exists() or EQUIVOCATION_STATE_FILE.stat().st_size == 0:
+        return {}
+    
+    with open(EQUIVOCATION_STATE_FILE, "r") as f:
+        try:
+            return {
+                k: base64.b64decode(v.encode('utf-8'))
+                for k, v in json.load(f).items()
+            }
+        except (json.JSONDecodeError, base64.binascii.Error):
+            return {}
+        
+def clear_equivocation_state() -> None:
+    """Delete the contents of the equivocation state file."""
+    with open(EQUIVOCATION_STATE_FILE, "w") as f:
+        f.write("")
+
+def save_penalizing_txid(txid: TxidStr) -> None:
+    """Save the penalizing txid to a file."""
+    with open(PENALIZING_TXID_FILE, "w") as f:
+        f.write(txid)
+        
+def load_penalizing_txid() -> TxidStr:
+    """Load the penalizing txid from a file."""
+    with open(PENALIZING_TXID_FILE, "r") as f:
+        return f.read().strip()
+    
+def clear_penalizing_txid() -> None:
+    """Delete the contents of the penalizing txid file."""
+    with open(PENALIZING_TXID_FILE, "w") as f:
+        f.write("")

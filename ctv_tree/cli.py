@@ -4,6 +4,9 @@ from utils import (
     TxidStr,
     txid_to_bytes,
     generateblocks,
+    bold,
+    clear_equivocation_state,
+    clear_penalizing_txid,
 )
 import sys
 import pprint
@@ -26,10 +29,21 @@ cli = App(usage=__doc__)
 @cli.cmd
 def encumber():
     """
-    Returns the txid of the coin spent into the CTV, which is used to resume CTV
+    1. Clear contents of equivocation state file.
+    2. Initializes the penalizing transaction to prevent spender from double-spending
+    3. Returns the txid of the coin spent into the CTV, which is used to resume CTV
     operations.
     """
     c = CtvTreeScenario.for_demo()
+    
+    print(bold("# Clearing out equivocation state and resetting penalizing txid\n"))
+    clear_equivocation_state()
+    clear_penalizing_txid()
+    
+    print(bold("# Creating transaction to penalize equivocation\n"))
+    # TODO - Create transaction to penalize equivocation
+    #c.exec.init_penalizing_tx(c.from_wallet.privkey)
+    
     c.exec.send_to_vault(c.coin_in, c.from_wallet.privkey)
     # TODO - Uncomment this later
     # assert not c.exec.search_for_unvault()
@@ -78,9 +92,14 @@ def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
     spending_wallet = c.output1_wallet if leaf_index == 0 else c.output2_wallet
     # Set recipient address based on leaf index (0 or 1)
     recipient_pubkey = c.A_wallet.privkey.point if leaf_index == 0 else c.B_wallet.privkey.point
+    # TODO - This can be replaced by a unique identifier for each recipient
+    recipient_name = "A" if leaf_index == 0 else "B"
     
     ctv_tx = c.plan.tohot_txid
     print(f"Spending output from tx: {ctv_tx}")
+    
+    # Use non-equivocating contracts to verify that the tx is not double-spent
+    c.exec.verify_equivocation(recipient_name, leaf_index)
 
     tx = CMutableTransaction()
     tx.nVersion = 2

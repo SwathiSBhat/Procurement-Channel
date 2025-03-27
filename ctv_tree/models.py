@@ -1,6 +1,8 @@
 import sys
 import pprint
 import typing as t
+import authenticator
+import uuid
 
 from dataclasses import dataclass
 from bitcoin import SelectParams
@@ -33,13 +35,18 @@ from utils import (
     bold,
     yellow,
     green,
-    blue,
+    load_equivocation_state,
+    save_equivocation_state,
+    load_penalizing_txid,
+    save_penalizing_txid,
 )
 from constants import Sats, TxidStr, RawTxStr
 
 # For use with template transactions.
 BLANK_INPUT = CMutableTxIn
 OP_CHECKTEMPLATEVERIFY = script.OP_NOP4
+
+from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Coin:
@@ -74,9 +81,9 @@ class Wallet:
             network,
         )
 
-    def fund(self, rpc: BitcoinRPC) -> Coin:
+    def fund(self, rpc: BitcoinRPC, blocks_to_mine: int = 110) -> Coin:
         fund_addr = self.privkey.point.p2wpkh_address(network=self.network)
-        rpc.generatetoaddress(110, fund_addr)
+        rpc.generatetoaddress(blocks_to_mine, fund_addr)
 
         scan = scan_utxos(rpc, fund_addr)
         assert scan["success"]
@@ -131,9 +138,13 @@ class CtvTreePlan:
     fees_pubkey: S256Point
     clientA_pubkey: S256Point
     clientB_pubkey: S256Point
+    penalty_pubkey: S256Point # Public key for the penalizing transaction
 
     # The coin being committed to the vault.
     coin_in: Coin
+    
+    # The coin used for penalizing equivocation
+    penalize_coin: Coin
 
     # How many blocks to delay the vault -> hot PK path.
     block_delay: int
@@ -142,6 +153,12 @@ class CtvTreePlan:
     # Note this isn't how you'd actually do it (would want to specify feerate),
     # but is a simplification for this demo.
     fees_per_step: Sats = 10000
+    
+    # Authenticator instances used for non-equivocating contracts
+    # auth - Authenticator instance from secret key used by sender to generate assertion for ct,st pair
+    # auth_dpk - Authenticator instance from derived public key used by recipient to verify assertion and extract secret key in case of equivocation
+    auth: t.Optional[authenticator.Authenticator] = None
+    auth_dpk: t.Optional[authenticator.Authenticator] = None
 
     def __post_init__(self):
         """
@@ -160,8 +177,13 @@ class CtvTreePlan:
         self.unvault_outpoint2 = COutPoint(txid_to_bytes(self.unvault_txid), 1)
 
         self.tohot_txid = get_txid(self.tohot_tx_unsigned)
+        
+        # TODO - Store penalizing txid here
         # self.tocold_txid = get_txid(self.tocold_tx_unsigned)
         
+        # Store a map of context (leaf_index) to statement (recipient_uuid)
+        self.context_to_statement: dict[str, any] = load_equivocation_state()
+        print(f"Loaded equivocation state: {self.context_to_statement}")
 
     def amount_at_step(self, step=0) -> Sats:
         """
@@ -171,6 +193,78 @@ class CtvTreePlan:
         amt = self.coin_in.amount - (self.fees_per_step * step)
         assert amt > 0
         return amt
+    
+    @property 
+    def to_penalize_tx_unsigned(self) -> CMutableTransaction:
+        """
+        Create a transaction that spends from the penalize_coin to the penalty_pubkey
+        """
+        tx = CMutableTransaction()
+        tx.nVersion = 2
+        tx.vin = [CTxIn(self.penalize_coin.outpoint, nSequence=0)]
+        
+        return tx
+    
+    def sign_penalizing_tx(self, from_privkey: PrivateKey) -> CTransaction:
+        tx = self.to_penalize_tx_unsigned
+
+        penalize_amount = self.penalize_coin.amount - self.fees_per_step
+        # This implements:
+        #   IF 
+        #     <penalty_pubkey> CHECKSIGVERIFY 
+        #   ELSE 
+        #     <200> CHECKSEQUENCEVERIFY DROP 
+        #     <from_pubkey> CHECKSIG
+        #   ENDIF
+        penalize_script = CScript([
+            script.OP_IF,
+            self.penalty_pubkey.sec(), script.OP_CHECKSIGVERIFY,
+            script.OP_ELSE,
+            200, script.OP_CHECKSEQUENCEVERIFY, script.OP_DROP,
+            from_privkey.point.sec(), script.OP_CHECKSIG,
+            script.OP_ENDIF
+        ])
+        
+        tx.vout = [
+            CTxOut(penalize_amount,
+                   CScript([script.OP_0, sha256(penalize_script)]))
+        ]
+        
+        spend_from_addr = CBech32BitcoinAddress.from_scriptPubKey(
+        CScript(self.penalize_coin.scriptPubKey)
+        )
+        
+        redeem_script = CScript(
+            [
+                script.OP_DUP,
+                script.OP_HASH160,
+                spend_from_addr,
+                script.OP_EQUALVERIFY,
+                script.OP_CHECKSIG,
+            ]
+        )
+
+        sighash = script.SignatureHash(
+            redeem_script,
+            tx,
+            0,  # input index
+            script.SIGHASH_ALL,
+            amount=self.penalize_coin.amount,
+            sigversion=script.SIGVERSION_WITNESS_V0,
+        )
+    
+        sig = from_privkey.sign(int.from_bytes(sighash, "big")).der() + bytes(
+            [script.SIGHASH_ALL]
+        )
+        
+        wit = [CTxInWitness(CScriptWitness([sig, from_privkey.point.sec()]))]
+        tx.wit = CTxWitness(wit)
+        
+        print(f"Created penalizing transaction: {green(bytes_to_txid(tx.GetTxid()))}")
+        print(f"Can be claimed by penalty wallet immediately if equivocation detected")
+        print(f"Will return to from_wallet after 200 blocks if unclaimed")
+        
+        return CTransaction.from_tx(tx)
 
     # tovault transaction
     # -------------------------------
@@ -290,26 +384,6 @@ class CtvTreePlan:
                 # fmt: on
             ]
         )
-        
-    @property
-    def unvault_redeemScript_A(self) -> CScript:
-        return CScript(
-            [
-                # fmt: off
-                self.clientA_pubkey.sec(), script.OP_CHECKSIG
-                # fmt: on
-            ]
-        )
-    
-    @property
-    def unvault_redeemScript_B(self) -> CScript:
-        return CScript(
-            [
-                # fmt: off
-                self.clientB_pubkey.sec(), script.OP_CHECKSIG
-                # fmt: on
-            ]
-        )
     
     @property
     def unvault_tx_unsigned(self) -> CMutableTransaction:
@@ -425,7 +499,61 @@ class CtvTreePlan:
 
         return CTransaction.from_tx(tx)
 
-
+    # Verifying equivocation
+    # -------------------------------
+    def get_verify_equivocation(self, context, statement):
+        """
+        If 2 different statements are provided for same context, reveal secret key
+        """
+        context_bytes = context.to_bytes(8, 'big')
+        statement_bytes = statement.encode('utf-8')
+        
+        # Reject if context length > 8 bytes
+        if len(context_bytes) > 8:
+            raise ValueError("Context length must be exactly 8 bytes")
+        
+        if len(context_bytes) < 8:
+            context_bytes = context_bytes.ljust(8, b'\x00')
+            
+        # Sender sends tau for current context, statement pair
+        print(f"Context length: {len(context_bytes)}, statement length: {len(statement_bytes)}")
+        tau = self.auth.authenticate(context_bytes, statement_bytes)
+        
+        # Recipient verifies the assertion
+        # TODO - Ideally, recipient should also check time t < T in penalizing transaction
+        is_valid = self.auth_dpk.verify(tau, context_bytes, statement_bytes)
+        
+        if not is_valid:
+            raise ValueError("Invalid assertion")
+        
+        # Print context_to_statement dict:
+        print(f"Current context_to_statement: {self.context_to_statement}")
+        dict_key = str(context)
+        print(f"Checking for context {dict_key} in context_to_statement {dict_key in self.context_to_statement}")
+        
+        # Check for equivocation
+        if dict_key in self.context_to_statement:
+            if self.context_to_statement[dict_key] != statement:
+                print(f"Existing statement: {self.context_to_statement[dict_key]}, current statement: {statement}")
+                # Reveal secret key
+                # TODO - Tau should ideally be stored in the dict as well
+                # Need to figure out how to serialize it
+                tau_previous = self.auth.authenticate(context_bytes, self.context_to_statement[dict_key])
+                self.auth_dpk.extract(
+                    tau_previous, 
+                    tau, 
+                    context_bytes, 
+                    self.context_to_statement[dict_key], 
+                    statement_bytes)
+                print(f"Secret key revealed for context {context}")
+                extracted_sk = self.auth_dpk.getDsk()
+                print(f"Extracted secret key: {extracted_sk}")
+                # TODO - Broadcast transaction to get funds
+        else:
+            self.context_to_statement[context] = statement_bytes
+            save_equivocation_state(self.context_to_statement)
+            print(f"Tau stored for context {context}")
+        return
         
 @dataclass
 class CtvTreeExecutor:
@@ -434,8 +562,20 @@ class CtvTreeExecutor:
     coin_in: Coin
 
     log: t.Callable = no_output
+    
+    def init_penalizing_tx(self, spend_key: PrivateKey) -> TxidStr:
+        """
+        Create a time-locked penalizing transaction that:
+        - Spends from the penalize_coin (funded by from_wallet)
+        - Can be claimed by penalize_wallet immediately if equivocation is detected
+        - Or returns to from_wallet after 200 blocks (timeout)
+        """
+        (tx, raw_tx) = self._print_signed_tx(self.plan.sign_penalizing_tx, spend_key)
+        txid = self.rpc.sendrawtransaction(raw_tx)
+        save_penalizing_txid(txid)
+        
 
-    def send_to_vault(self, coin: Coin, spend_key: PrivateKey) -> TxidStr:
+    def send_to_vault(self, coin: Coin, spend_key: PrivateKey) -> TxidStr:        
         self.log(bold("# Sending to vault\n"))
 
         self.log(f"Spending coin ({coin.outpoint}) {bold(f'({coin.amount} sats)')}")
@@ -475,6 +615,21 @@ class CtvTreeExecutor:
 
         (tx, _) = self._print_signed_tx(self.plan.sign_tohot_tx, output1_privkey, output2_privkey)
         return tx
+    
+    def verify_equivocation(self, recipient: str, leaf_index: int):
+        """
+        Verify that the transaction has not been double-spent using non-equivocating
+        contracts.
+        """
+        context = leaf_index
+        # statement = recipient + '_' + random number
+        statement = recipient + '_' + str(uuid.uuid1())
+        
+        self.log(bold(f"# Verifying equivocation for context: {context} and statement: {statement}"))
+        self.log()
+        
+        self.plan.get_verify_equivocation(context, statement)
+        return
 
     def _print_signed_tx(
         self, signed_txn_fnc, *args, **kwargs
@@ -499,6 +654,8 @@ class CtvTreeScenario:
     rpc: BitcoinRPC
 
     from_wallet: Wallet
+    # Generate a wallet for penalizing sender for equivocation
+    penalize_wallet: Wallet
     fee_wallet: Wallet
     output1_wallet: Wallet
     output2_wallet: Wallet
@@ -508,11 +665,17 @@ class CtvTreeScenario:
 
     plan: CtvTreePlan
     exec: CtvTreeExecutor
+    # This will be used by the sender to assert ct,st pair
+    auth: t.Optional[authenticator.Authenticator] = None  # Authenticator instance
+    # This will be used by the recipient to verify the assertion and extract secret key in case of equivocation
+    auth_dpk: t.Optional[authenticator.Authenticator] = None  # Authenticator instance from derived public key
 
     @classmethod
     def from_network(cls, network: str, seed: bytes, coin: Coin = None, **plan_kwargs):
         SelectParams(network)
+        # Use deterministic seeds to ensure same addresses are generated across each cli cmd
         from_wallet = Wallet.generate(b"from-" + seed)
+        penalize_wallet = Wallet.generate(b"penalize-" + seed)
         fee_wallet = Wallet.generate(b"fee-" + seed)
         output2_wallet = Wallet.generate(b"output2-" + seed)
         output1_wallet = Wallet.generate(b"output1-" + seed)
@@ -522,14 +685,26 @@ class CtvTreeScenario:
         B_wallet = Wallet.generate(b"B-" + seed)
 
         rpc = BitcoinRPC(net_name=network)
+        # Fund wallet during intialization for penalizing equivocation
+        if coin is None:
+            penalize_coins = from_wallet.fund(rpc, 220)
+            print(f"Wallet funded with {penalize_coins.amount} sats for penalizing equivocation")
+        else:
+            penalizing_txid = load_penalizing_txid()
+            penalize_coins = Coin.from_txid(penalizing_txid, 0, rpc) 
+            print(f"Penalizing txid: {penalizing_txid}")
+            
         coin = coin or from_wallet.fund(rpc)
+           
         plan = CtvTreePlan(
             output1_wallet.privkey.point,
             output2_wallet.privkey.point,
             fee_wallet.privkey.point,
             A_wallet.privkey.point,
             B_wallet.privkey.point,
+            penalize_wallet.privkey.point,
             coin,
+            penalize_coins,
             **plan_kwargs,
         )
 
@@ -537,6 +712,7 @@ class CtvTreeScenario:
             network,
             rpc,
             from_wallet=from_wallet,
+            penalize_wallet=penalize_wallet,
             fee_wallet=fee_wallet,
             output1_wallet=output1_wallet,
             output2_wallet=output2_wallet,
@@ -564,6 +740,19 @@ class CtvTreeScenario:
             "regtest", seed=b"demo", coin=coin_in, block_delay=0
         )
         c.exec.log = lambda *args, **kwargs: print(*args, file=sys.stderr, **kwargs)
+        
+        privkey_bytes = c.penalize_wallet.privkey.secret.to_bytes(32, 'big')
+        c.auth = authenticator.Authenticator(privkey_bytes)
+        print("Authenticator initialized with secret key.")
+        
+        # Get derived public key
+        dpk = c.auth.getDpk()
+        print(f"Derived public key (dpk): {dpk}")
+        c.auth_dpk = authenticator.Authenticator(dpk)
+        
+        c.plan.auth = c.auth
+        c.plan.auth_dpk = c.auth_dpk
+            
         return c
 
 def _broadcast_final(c: CtvTreeScenario, tx: CTransaction):
