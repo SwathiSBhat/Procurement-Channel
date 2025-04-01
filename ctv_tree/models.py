@@ -41,6 +41,7 @@ from utils import (
     save_penalizing_txid,
 )
 from constants import Sats, TxidStr, RawTxStr
+from typing import List
 
 # For use with template transactions.
 BLANK_INPUT = CMutableTxIn
@@ -141,6 +142,7 @@ class CtvTreePlan:
     """
 
     # SEC-encoded public keys associated with various identities in the vault scheme.
+    funding_pubkey: S256Point
     hot_pubkey: S256Point
     cold_pubkey: S256Point
     fees_pubkey: S256Point
@@ -226,7 +228,7 @@ class CtvTreePlan:
         #   ENDIF
         penalize_script = CScript([
             script.OP_IF,
-            self.penalty_pubkey.sec(), script.OP_CHECKSIGVERIFY,
+            self.penalty_pubkey.sec(), script.OP_CHECKSIG,
             script.OP_ELSE,
             200, script.OP_CHECKSEQUENCEVERIFY, script.OP_DROP,
             from_privkey.point.sec(), script.OP_CHECKSIG,
@@ -507,9 +509,69 @@ class CtvTreePlan:
 
         return CTransaction.from_tx(tx)
 
-    # Verifying equivocation
+    # Verifying equivocation and claiming collateral after equivocation
     # -------------------------------
-    def get_verify_equivocation(self, context, statement):
+    
+    def claim_collateral(self, extracted_sk_bytes: bytes) -> CTransaction:
+        """
+        Claim collateral after equivocation is detected.
+        Spend using the penalizing key to the penalty wallet.
+        # TODO - Send equally to other clients too. Currently, it just goes to A
+        """
+        try:
+            from buidl.ecc import PrivateKey
+            extracted_sk = PrivateKey(secret=int.from_bytes(extracted_sk_bytes, 'big'))
+            
+            # Verify the extracted key matches penalty pubkey
+            if extracted_sk.point.sec() != self.penalty_pubkey.sec():
+                raise ValueError("Extracted key doesn't match penalty pubkey")
+                
+        except Exception as e:
+            raise ValueError(f"Invalid secret key: {e}")
+        
+        # Create transaction
+        tx = CMutableTransaction()
+        tx.nVersion = 2
+        tx.vin = [CTxIn(self.penalize_coin.outpoint, nSequence=0)]
+        
+        # Output sends to penalty wallet (minus fee)
+        amount = self.penalize_coin.amount - self.fees_per_step
+        tx.vout = [CTxOut(amount,  CScript([script.OP_0, self.clientA_pubkey.hash160()]))]
+        
+        # Penalty redeem script
+        penalty_script = CScript([
+            script.OP_IF,
+            self.penalty_pubkey.sec(), script.OP_CHECKSIG,
+            script.OP_ELSE,
+            200, script.OP_CHECKSEQUENCEVERIFY, script.OP_DROP,
+            self.funding_pubkey.sec(), script.OP_CHECKSIG,
+            script.OP_ENDIF
+        ])
+
+        # Verify script hash
+        assert sha256(penalty_script).hex() == "209815ba365440408e8e39d109faa0e14e581687febf9446ecf7a1242c6cf713", \
+            "Script hash mismatch - keys or script structure changed"
+        
+        # Sign for the IF branch (penalty path)
+        sighash = script.SignatureHash(
+            penalty_script,
+            tx,
+            0,
+            script.SIGHASH_ALL,
+            amount=self.penalize_coin.amount,
+            sigversion=script.SIGVERSION_WITNESS_V0,
+        )
+        
+        sig = extracted_sk.sign(int.from_bytes(sighash, "big")).der() + bytes([script.SIGHASH_ALL])
+        
+        # Construct witness for IF branch
+        witness = CScriptWitness([sig, b'\x01', penalty_script])
+        tx.wit = CTxWitness([CTxInWitness(witness)])
+        
+        print(f"Collateral claim transaction: {tx}")
+        return CTransaction.from_tx(tx)
+    
+    def get_verify_equivocation(self, context, statement) -> t.Optional[CTransaction]:
         """
         If 2 different statements are provided for same context, reveal secret key
         """
@@ -557,11 +619,13 @@ class CtvTreePlan:
                 extracted_sk = self.auth_dpk.getDsk()
                 print(f"Extracted secret key: {extracted_sk}")
                 # TODO - Broadcast transaction to get funds
+                claim_tx = self.claim_collateral(extracted_sk)
+                return claim_tx
         else:
             self.context_to_statement[context] = statement_bytes
             save_equivocation_state(self.context_to_statement)
             print(f"Tau stored for context {context}")
-        return
+        return None
         
 @dataclass
 class CtvTreeExecutor:
@@ -582,7 +646,6 @@ class CtvTreeExecutor:
         txid = self.rpc.sendrawtransaction(raw_tx)
         save_penalizing_txid(txid)
         
-
     def send_to_vault(self, coin: Coin, spend_key: PrivateKey) -> TxidStr:        
         self.log(bold("# Sending to vault\n"))
 
@@ -596,14 +659,15 @@ class CtvTreeExecutor:
         self.log(f"Coins are vaulted at {green(txid)}")
         return txid
 
-    def start_unvault(self) -> TxidStr:
+    def start_unvault(self) -> CTransaction:
         self.log(bold("# Starting unvault"))
 
-        _, hx = self._print_signed_tx(self.plan.sign_unvault_tx)
-        txid = self.rpc.sendrawtransaction(hx)
+        tx, hx = self._print_signed_tx(self.plan.sign_unvault_tx)
+        # txid = self.rpc.sendrawtransaction(hx)
+        txid = bytes_to_txid(tx.GetTxid())
         self.unvault_outpoint1 = COutPoint(txid_to_bytes(txid), 0)
         self.unvault_outpoint2 = COutPoint(txid_to_bytes(txid), 1)
-        return txid
+        return tx
     
     def get_tohot_tx(self, output1_privkey, output2_privkey) -> CTransaction:
         output1_addr = self.plan.hot_pubkey.p2wpkh_address(self.rpc.net_name)
@@ -636,7 +700,13 @@ class CtvTreeExecutor:
         self.log(bold(f"# Verifying equivocation for context: {context} and statement: {statement}"))
         self.log()
         
-        self.plan.get_verify_equivocation(context, statement)
+        collateral_tx = self.plan.get_verify_equivocation(context, statement)
+        
+        # If collateral tx is not empty, claim collateral
+        if collateral_tx is not None:
+            collateral_txid = self.rpc.sendrawtransaction(collateral_tx.serialize().hex())
+            print(f"Collateral claimed in transaction: {green(collateral_txid)}")
+            
         return
 
     def _print_signed_tx(
@@ -705,6 +775,7 @@ class CtvTreeScenario:
         coin = coin or from_wallet.fund(rpc)
            
         plan = CtvTreePlan(
+            from_wallet.privkey.point,
             output1_wallet.privkey.point,
             output2_wallet.privkey.point,
             fee_wallet.privkey.point,
@@ -762,12 +833,37 @@ class CtvTreeScenario:
         c.plan.auth_dpk = c.auth_dpk
             
         return c
+    
+def is_tx_broadcast(c: CtvTreeScenario, txid: TxidStr) -> bool:
+    """
+    Check if txn has been broadcasted or part of mempool
+    """ 
+    # TODO - Can move this API call outside and store the mempool txids
+    mempool_txids = c.rpc.getrawmempool(False)
+    
+    if txid in mempool_txids:
+        print(f"Transaction {txid} is in mempool")
+        return True
+    
+    confirmed_txout = c.rpc.gettxout(txid, 0, False)
+    
+    if confirmed_txout:
+        print(f"Transaction {txid} is confirmed")
+        return True
+    return False
 
-def _broadcast_final(c: CtvTreeScenario, tx: CTransaction):
+def _broadcast_final(c: CtvTreeScenario, tx: CTransaction, parent_txns: List[CTransaction] = None):
     print()
 
-    if input(f"Broadcast transaction? (y/n) ") == 'y':
+    if input(f"Broadcast transaction? (y/n) (Including parent txns) ") == 'y':
         try:
+            # Broadcast parent transactions first
+            if parent_txns:
+                for parent_tx in parent_txns:
+                    if not is_tx_broadcast(c, parent_tx.GetTxid()[::-1].hex()):
+                        print(f"Broadcasting parent transaction: {parent_tx}")
+                        c.rpc.sendrawtransaction(parent_tx.serialize().hex())
+            
             print(f"Transaction to broadcast: {tx}")
             txid = c.rpc.sendrawtransaction(tx.serialize().hex())
         except JSONRPCError as e:

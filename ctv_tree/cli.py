@@ -41,7 +41,6 @@ def encumber():
     clear_penalizing_txid()
     
     print(bold("# Creating transaction to penalize equivocation\n"))
-    # TODO - Create transaction to penalize equivocation
     c.exec.init_penalizing_tx(c.from_wallet.privkey)
     
     # Mine blocks to confirm the penalizing tx
@@ -66,7 +65,8 @@ def unencumber(original_coin_txid: TxidStr):
         original_coin_txid: the txid of the original coin we spent into the vault.
     """
     c = CtvTreeScenario.for_demo(original_coin_txid)
-    c.exec.start_unvault()
+    tx = c.exec.start_unvault()
+    _broadcast_final(c, tx)
 
 @cli.cmd
 def to_children(original_coin_txid: TxidStr):
@@ -76,7 +76,11 @@ def to_children(original_coin_txid: TxidStr):
     c = CtvTreeScenario.for_demo(original_coin_txid)
     tx = c.exec.get_tohot_tx(c.output1_wallet.privkey, c.output2_wallet.privkey)
     # Broadcast the tx that satisfies the CTV on the main chain.
-    _broadcast_final(c, tx)
+    parent_tx = c.exec.start_unvault()
+    print(f"Parent tx: {parent_tx}")
+    # Send array of parent txns to broadcast
+    parent_txns = [parent_tx]
+    _broadcast_final(c, tx, parent_txns)
 
 @cli.cmd
 def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
@@ -134,7 +138,10 @@ def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
     # Witness must be EXACTLY [signature, pubkey] for P2WPKH
     tx.wit = CTxWitness([CTxInWitness(CScriptWitness([sig, spending_wallet.privkey.point.sec()]))])
     
-    _broadcast_final(c, tx)
+    # Parent transactions to broadcast if not already done
+    parent_txns = [c.exec.start_unvault(), c.exec.get_tohot_tx(c.output1_wallet.privkey, c.output2_wallet.privkey)]
+    
+    _broadcast_final(c, tx, parent_txns)
 
 @cli.cmd
 def generate_blocks(n: int):

@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+equivocation_state.json
+penalizing_txid.txt
