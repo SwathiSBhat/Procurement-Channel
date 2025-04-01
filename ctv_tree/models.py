@@ -35,6 +35,9 @@ from utils import (
     bold,
     yellow,
     green,
+    red,
+    blue,
+    cyan,
     load_equivocation_state,
     save_equivocation_state,
     load_penalizing_txid,
@@ -188,12 +191,9 @@ class CtvTreePlan:
 
         self.tohot_txid = get_txid(self.tohot_tx_unsigned)
         
-        # TODO - Store penalizing txid here
-        # self.tocold_txid = get_txid(self.tocold_tx_unsigned)
-        
         # Store a map of context (leaf_index) to statement (recipient_uuid)
         self.context_to_statement: dict[str, any] = load_equivocation_state()
-        print(f"Loaded equivocation state: {self.context_to_statement}")
+        print(f"Loaded equivocation state: {self.context_to_statement}\n")
 
     def amount_at_step(self, step=0) -> Sats:
         """
@@ -271,8 +271,6 @@ class CtvTreePlan:
         tx.wit = CTxWitness(wit)
         
         print(f"Created penalizing transaction: {green(bytes_to_txid(tx.GetTxid()))}")
-        print(f"Can be claimed by penalty wallet immediately if equivocation detected")
-        print(f"Will return to from_wallet after 200 blocks if unclaimed")
         
         return CTransaction.from_tx(tx)
 
@@ -439,23 +437,8 @@ class CtvTreePlan:
         # Ensure the transaction has two outputs
         assert len(tx.vout) >= 2, "Transaction must have at least two outputs"
 
-        print(f"Hot pubkey compressed: {self.hot_pubkey.sec(compressed=True).hex()}")
-        print(f"Cold pubkey compressed: {self.cold_pubkey.sec(compressed=True).hex()}")
-        print(f"Hot punkey hash160: {self.hot_pubkey.hash160().hex()}")
-        print(f"Cold pubkey hash160: {self.cold_pubkey.hash160().hex()}")
-
-        print(f"Input amount: {self.coin_in.amount / COIN} BTC")
-        print(f"Output 1 amount: {tx.vout[0].nValue / COIN} BTC")
-        print(f"Output 2 amount: {tx.vout[1].nValue / COIN} BTC")
-        print(f"Fee management output: {tx.vout[2].nValue / COIN} BTC")
-        print(f"Total output value: {(tx.vout[0].nValue + tx.vout[1].nValue + tx.vout[2].nValue) / COIN} BTC")
         # Split the amount into two equal parts
         half_amount = self.amount_at_step(2) // 2
-
-        print(f"Redeem script for output 1: {self.unvault_redeemScript_output1.hex()}")
-        print(f"Redeem script for output 2: {self.unvault_redeemScript_output2.hex()}")
-        print(f"Script hash for output 1: {sha256(self.unvault_redeemScript_output1).hex()}")
-        print(f"Script hash for output 2: {sha256(self.unvault_redeemScript_output2).hex()}")
 
         sighash1 = script.SignatureHash(
             self.unvault_redeemScript_output1,
@@ -469,10 +452,8 @@ class CtvTreePlan:
         sig1 = output1_privkey.sign(int.from_bytes(sighash1, "big")).der() + bytes(
             [script.SIGHASH_ALL]
         )
-        
         sig_obj = Signature.parse(sig1[:-1])  # Deserialize DER signature
         assert output1_privkey.point.verify(int.from_bytes(sighash1, "big"), sig_obj)
-
 
         sighash2 = script.SignatureHash(
             self.unvault_redeemScript_output2,
@@ -493,19 +474,7 @@ class CtvTreePlan:
         # Create the witness for the transaction
         witness1 = CScriptWitness([sig1, self.unvault_redeemScript_output1])
         witness2 = CScriptWitness([sig2, self.unvault_redeemScript_output2])
-
-        # Create the witness for the single input that will be split into two outputs
-        #witness = CScriptWitness([sig1, self.unvault_redeemScript_output1, sig2, self.unvault_redeemScript_output2])
-
-        #tx.wit = CTxWitness([CTxInWitness(witness)])
         tx.wit = CTxWitness([CTxInWitness(witness1), CTxInWitness(witness2)])
-
-        print(f"Witness for input 1: {witness1}")
-        print(f"Witness for input 2: {witness2}")
-        print(f"Signature for input 1: {sig1.hex()}")
-        print(f"Signature for input 2: {sig2.hex()}")
-        print(f"Signature hash for input 1: {sighash1.hex()}")
-        print(f"Signature hash for input 2: {sighash2.hex()}")
 
         return CTransaction.from_tx(tx)
 
@@ -568,7 +537,7 @@ class CtvTreePlan:
         witness = CScriptWitness([sig, b'\x01', penalty_script])
         tx.wit = CTxWitness([CTxInWitness(witness)])
         
-        print(f"Collateral claim transaction: {tx}")
+        # print(f"Collateral claim transaction: {tx}")
         return CTransaction.from_tx(tx)
     
     def get_verify_equivocation(self, context, statement) -> t.Optional[CTransaction]:
@@ -586,7 +555,6 @@ class CtvTreePlan:
             context_bytes = context_bytes.ljust(8, b'\x00')
             
         # Sender sends tau for current context, statement pair
-        print(f"Context length: {len(context_bytes)}, statement length: {len(statement_bytes)}")
         tau = self.auth.authenticate(context_bytes, statement_bytes)
         
         # Recipient verifies the assertion
@@ -596,15 +564,12 @@ class CtvTreePlan:
         if not is_valid:
             raise ValueError("Invalid assertion")
         
-        # Print context_to_statement dict:
-        print(f"Current context_to_statement: {self.context_to_statement}")
         dict_key = str(context)
-        print(f"Checking for context {dict_key} in context_to_statement {dict_key in self.context_to_statement}")
+        print(bold(f"Equivocation detected for context {dict_key}? : {dict_key in self.context_to_statement}"))
         
         # Check for equivocation
         if dict_key in self.context_to_statement:
             if self.context_to_statement[dict_key] != statement:
-                print(f"Existing statement: {self.context_to_statement[dict_key]}, current statement: {statement}")
                 # Reveal secret key
                 # TODO - Tau should ideally be stored in the dict as well
                 # Need to figure out how to serialize it
@@ -615,10 +580,9 @@ class CtvTreePlan:
                     context_bytes, 
                     self.context_to_statement[dict_key], 
                     statement_bytes)
-                print(f"Secret key revealed for context {context}")
+                print(red(f"Secret key revealed for context {context}"))
                 extracted_sk = self.auth_dpk.getDsk()
-                print(f"Extracted secret key: {extracted_sk}")
-                # TODO - Broadcast transaction to get funds
+                
                 claim_tx = self.claim_collateral(extracted_sk)
                 return claim_tx
         else:
@@ -626,6 +590,48 @@ class CtvTreePlan:
             save_equivocation_state(self.context_to_statement)
             print(f"Tau stored for context {context}")
         return None
+    
+    def spend_leaf(self, spender_key: PrivateKey, recipient_pubkey: S256Point, leaf_index: int) -> CTransaction:
+        """
+        Spend the leaves of the tree to the recipient based on the leaf index
+        Leaf index = 0 -> send to A
+        Leaf index = 1 -> send to B
+        """
+        # TODO - This can be replaced by a unique identifier for each recipient
+        recipient_name = "A" if leaf_index == 0 else "B"
+        ctv_tx = self.tohot_txid
+        
+        print(f"Spending output from tx: {ctv_tx} to recipient {recipient_name}")
+        
+        # Create transaction
+        tx = CMutableTransaction()
+        tx.nVersion = 2
+        tx.vin = [CTxIn(COutPoint(txid_to_bytes(ctv_tx), leaf_index), nSequence=0)]
+        input_amount = self.tohot_tx_unsigned.vout[leaf_index].nValue
+        print(f"Input amount: {input_amount / COIN} BTC")
+        
+        # Output = input - fees (10000 sats)
+        tx.vout = [CTxOut(input_amount - 10000, CScript([script.OP_0, recipient_pubkey.hash160()]))]
+        # Generate signature for P2WPKH
+        script_code = CScript([script.OP_DUP, script.OP_HASH160, 
+                            spender_key.point.hash160(), 
+                            script.OP_EQUALVERIFY, script.OP_CHECKSIG])
+        
+        sighash = script.SignatureHash(
+            script_code,
+            tx,
+            0,
+            script.SIGHASH_ALL,
+            amount=input_amount,
+            sigversion=script.SIGVERSION_WITNESS_V0,
+        )
+        
+        sig = spender_key.sign(int.from_bytes(sighash, 'big')).der() + bytes([script.SIGHASH_ALL])
+        
+        # Witness must be EXACTLY [signature, pubkey] for P2WPKH
+        tx.wit = CTxWitness([CTxInWitness(CScriptWitness([sig, spender_key.point.sec()]))])
+        
+        return CTransaction.from_tx(tx)
         
 @dataclass
 class CtvTreeExecutor:
@@ -649,14 +655,12 @@ class CtvTreeExecutor:
     def send_to_vault(self, coin: Coin, spend_key: PrivateKey) -> TxidStr:        
         self.log(bold("# Sending to vault\n"))
 
-        self.log(f"Spending coin ({coin.outpoint}) {bold(f'({coin.amount} sats)')}")
+        self.log(f"Spending {bold(f'({coin.amount} sats)')} to vault.")
         (tx, hx) = self._print_signed_tx(self.plan.sign_tovault_tx, spend_key)
 
         txid = self.rpc.sendrawtransaction(hx)
         assert txid == tx.GetTxid()[::-1].hex() == self.plan.tovault_txid
 
-        self.log()
-        self.log(f"Coins are vaulted at {green(txid)}")
         return txid
 
     def start_unvault(self) -> CTransaction:
@@ -673,17 +677,6 @@ class CtvTreeExecutor:
         output1_addr = self.plan.hot_pubkey.p2wpkh_address(self.rpc.net_name)
         output2_addr = self.plan.cold_pubkey.p2wpkh_address(self.rpc.net_name)
         self.log(bold(f"# Sweep to children addresses ({output1_addr}) and ({output2_addr})"))
-        print(f"Sweeping to {output1_addr} and {output2_addr}")
-        print(f"Output1 key: {output1_privkey} Output2 key: {output2_privkey}")
-
-        output1_pubkey = output1_privkey.point
-        output2_pubkey = output2_privkey.point
-
-        # Print the public key in SEC format (compressed or uncompressed)
-        print("Public key (uncompressed):", output1_pubkey.sec(compressed=False).hex())
-        print("Public key output1 (compressed):", output1_pubkey.sec(compressed=True).hex())
-        print("Public key (uncompressed):", output2_pubkey.sec(compressed=False).hex())
-        print("Public key output2 (compressed):", output2_pubkey.sec(compressed=True).hex())
 
         (tx, _) = self._print_signed_tx(self.plan.sign_tohot_tx, output1_privkey, output2_privkey)
         return tx
@@ -708,6 +701,21 @@ class CtvTreeExecutor:
             print(f"Collateral claimed in transaction: {green(collateral_txid)}")
             
         return
+    
+    def spend_leaves(self, spender_key: PrivateKey, recipient_pubkey: S256Point, leaf_index: int) -> CTransaction:
+        """
+        Spend the leaves of the tree to the recipient based on the leaf index
+        Leaf index = 0 -> send to A
+        Leaf index = 1 -> send to B
+        """
+        # TODO - This can be replaced by a unique identifier for each recipient
+        recipient_name = "A" if leaf_index == 0 else "B"
+        
+        self.log(bold(f"# Spending  to {recipient_name}"))
+        self.log()
+        
+        (tx, _) = self._print_signed_tx(self.plan.spend_leaf, spender_key, recipient_pubkey, leaf_index)
+        return tx
 
     def _print_signed_tx(
         self, signed_txn_fnc, *args, **kwargs
@@ -719,8 +727,8 @@ class CtvTreeExecutor:
         self.log(bold(f"\n## Transaction {yellow(tx.GetTxid()[::-1].hex())}"))
         self.log(f"{tx}")
         self.log()
-        self.log("### Raw hex")
-        self.log(hx)
+        # self.log("### Raw hex")
+        # self.log(hx)
 
         return tx, hx
     
@@ -766,11 +774,10 @@ class CtvTreeScenario:
         # Fund wallet during intialization for penalizing equivocation
         if coin is None:
             penalize_coins = from_wallet.fund(rpc, 220)
-            print(f"Wallet funded with {penalize_coins.amount} sats for penalizing equivocation")
         else:
             penalizing_txid = load_penalizing_txid()
             penalize_coins = Coin.from_txid(penalizing_txid, 0, rpc) 
-            print(f"Penalizing txid: {penalizing_txid}")
+            print(bold(f"Penalizing txid: {penalizing_txid}"))
             
         coin = coin or from_wallet.fund(rpc)
            
@@ -814,7 +821,6 @@ class CtvTreeScenario:
             rpc = BitcoinRPC(net_name="regtest")
             coin_in = Coin.from_txid(original_coin_txid, 0, rpc)
 
-        # TODO - Check blockdelay
         c = CtvTreeScenario.from_network(
             "regtest", seed=b"demo", coin=coin_in, block_delay=0
         )
@@ -822,16 +828,12 @@ class CtvTreeScenario:
         
         privkey_bytes = c.penalize_wallet.privkey.secret.to_bytes(32, 'big')
         c.auth = authenticator.Authenticator(privkey_bytes)
-        print("Authenticator initialized with secret key.")
         
         # Get derived public key
         dpk = c.auth.getDpk()
-        print(f"Derived public key (dpk): {dpk}")
         c.auth_dpk = authenticator.Authenticator(dpk)
-        
         c.plan.auth = c.auth
         c.plan.auth_dpk = c.auth_dpk
-            
         return c
     
 def is_tx_broadcast(c: CtvTreeScenario, txid: TxidStr) -> bool:
@@ -842,13 +844,13 @@ def is_tx_broadcast(c: CtvTreeScenario, txid: TxidStr) -> bool:
     mempool_txids = c.rpc.getrawmempool(False)
     
     if txid in mempool_txids:
-        print(f"Transaction {txid} is in mempool")
+        print(f"Parent transaction {txid} is in mempool")
         return True
     
     confirmed_txout = c.rpc.gettxout(txid, 0, False)
     
     if confirmed_txout:
-        print(f"Transaction {txid} is confirmed")
+        print(f"Parent transaction {txid} is already confirmed")
         return True
     return False
 
@@ -861,18 +863,17 @@ def _broadcast_final(c: CtvTreeScenario, tx: CTransaction, parent_txns: List[CTr
             if parent_txns:
                 for parent_tx in parent_txns:
                     if not is_tx_broadcast(c, parent_tx.GetTxid()[::-1].hex()):
-                        print(f"Broadcasting parent transaction: {parent_tx}")
+                        print(blue(f"Broadcasting parent transaction: {parent_tx.GetTxid()[::-1].hex()}"))
                         c.rpc.sendrawtransaction(parent_tx.serialize().hex())
             
-            print(f"Transaction to broadcast: {tx}")
+            print(cyan(f"Transaction to broadcast: {tx}"))
             txid = c.rpc.sendrawtransaction(tx.serialize().hex())
         except JSONRPCError as e:
             if 'missingorspent' in e.msg:
-                print("!!! can't broadcast - txn hasn't been seen yet")
+                print(bold(red("!!! can't broadcast - txn hasn't been seen yet")))
                 sys.exit(3)
             else:
                 raise
 
         print(f"Broadcast done: {green(txid)}")
         print()
-        pprint.pprint(c.rpc.gettxout(txid, 0))
