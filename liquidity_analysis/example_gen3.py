@@ -411,45 +411,87 @@ class ComprehensiveLightningNetwork:
                             highlight_edges=highlight_edges,
                             title=title)
 
-    def _visualize_network(self, highlight_nodes=None, highlight_edges=None, title=""):
-        """Helper method for visualization"""
+    def visualize_network(self, title="", highlight_nodes=None, highlight_edges=None):
+        """Visualize the network with balances in both directions"""
+        plt.figure(figsize=(20, 15))
         pos = nx.spring_layout(self.graph, k=0.5, iterations=50)
         
-        # Initialize default values if None
-        highlight_nodes = highlight_nodes or []
-        highlight_edges = highlight_edges or []
+        # Draw nodes
+        node_colors = ['red' if n in (highlight_nodes or []) else 'lightblue' 
+                    for n in self.graph.nodes()]
+        nx.draw_networkx_nodes(self.graph, pos, node_size=1000, node_color=node_colors, alpha=0.9)
         
-        # Draw all nodes
-        node_colors = ['red' if n in highlight_nodes else 'lightblue' for n in self.graph.nodes()]
-        nx.draw_networkx_nodes(self.graph, pos, node_size=700, node_color=node_colors)
+        # Draw edges
+        edge_colors = ['red' if (u,v) in (highlight_edges or []) else 'gray' 
+                    for u,v in self.graph.edges()]
+        nx.draw_networkx_edges(self.graph, pos, edge_color=edge_colors, width=2, 
+                            arrowstyle='->', arrowsize=20, alpha=0.7)
         
-        # Draw all edges
-        edge_colors = []
-        edge_widths = []
-        for u, v in self.graph.edges():
-            if (u, v) in highlight_edges:
-                edge_colors.append('red')
-                edge_widths.append(3.0)
-            else:
-                edge_colors.append('gray')
-                edge_widths.append(1.0)
+        # Prepare edge labels for both directions
+        edge_labels = {}
+        for u, v, data in self.graph.edges(data=True):
+            edge_labels[(u, v)] = f"{data['balance']} (fee:{data['fee']})"
         
-        nx.draw_networkx_edges(self.graph, pos, edge_color=edge_colors, width=edge_widths,
-                            arrowstyle='->', arrowsize=15)
+        # Draw edge labels with adjusted positions
+        nx.draw_networkx_edge_labels(
+            self.graph, pos, 
+            edge_labels=edge_labels,
+            font_size=8,
+            bbox=dict(alpha=0.7),
+            label_pos=0.3  # Adjust label position along edge
+        )
         
-        # Draw labels
-        nx.draw_networkx_labels(self.graph, pos, font_size=10)
+        # Draw node labels
+        nx.draw_networkx_labels(self.graph, pos, font_size=12, font_weight='bold')
         
-        # Draw edge balances (just outbound for clarity)
-        edge_labels = {(u, v): f"{self.get_balance(u, v)}" 
-                    for u, v in self.graph.edges() 
-                    if self.get_balance(u, v) > 0}
-        nx.draw_networkx_edge_labels(self.graph, pos, edge_labels=edge_labels, font_size=8)
-        
-        plt.title(title, fontsize=12)
+        plt.title(title, fontsize=16)
         plt.axis('off')
         plt.tight_layout()
         plt.show()
+
+    def visualize_all_scenarios(self):
+        """Visualize all generated scenarios"""
+        # Visualize intermediate failures
+        for i, example in enumerate(self.scenario_results['intermediate_failure']):
+            path_edges = list(zip(example['result']['path'][:-1], example['result']['path'][1:])) \
+                        if example['result']['path'] else []
+            self.visualize_network(
+                title=f"Scenario 1 Example {i+1}: {example['description']}",
+                highlight_edges=path_edges
+            )
+        
+        # Visualize multipart payments
+        for i, example in enumerate(self.scenario_results['multipart_payment']):
+            all_edges = []
+            for part in example['multi_result']['parts']:
+                if part['path']:
+                    all_edges.extend(list(zip(part['path'][:-1], part['path'][1:])))
+            self.visualize_network(
+                title=f"Scenario 2 Example {i+1}: {example['description']}\n"
+                    f"Total Fee: {example['multi_result']['total_fee']}",
+                highlight_edges=all_edges
+            )
+        
+        # Visualize ineffective rebalances
+        for i, example in enumerate(self.scenario_results['ineffective_rebalance']):
+            cycle_edges = list(zip(example['result']['cycle'][:-1], example['result']['cycle'][1:])) \
+                        if example['result']['cycle'] else []
+            self.visualize_network(
+                title=f"Scenario 3 Example {i+1}: {example['description']}",
+                highlight_nodes=[example['result']['node']],
+                highlight_edges=cycle_edges
+            )
+        
+        # Visualize cascading rebalances
+        for i, example in enumerate(self.scenario_results['cascading_rebalance']):
+            all_cycles = []
+            for res in example['results']:
+                if res['cycle']:
+                    all_cycles.extend(list(zip(res['cycle'][:-1], res['cycle'][1:])))
+            self.visualize_network(
+                title=f"Scenario 4 Example {i+1}: {example['description']}",
+                highlight_edges=all_cycles
+            )
 
 if __name__ == "__main__":
     # Create and run the simulation
@@ -458,7 +500,7 @@ if __name__ == "__main__":
     
     # Visualize specific examples
     print("\nVisualizing example scenarios...")
-    ln.visualize_scenario('intermediate_failure', 0)  # Show first intermediate failure example
-    ln.visualize_scenario('multipart_payment', 1)     # Show second multi-part example
-    ln.visualize_scenario('ineffective_rebalance', 2) # Show third ineffective rebalance
-    ln.visualize_scenario('cascading_rebalance', 2)   # Show complex cascade example
+    ln.visualize_all_scenarios()
+    
+    # Visualize final network state
+    ln.visualize_network("Final Network State")
