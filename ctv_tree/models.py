@@ -42,9 +42,11 @@ from utils import (
     save_equivocation_state,
     load_penalizing_txid,
     save_penalizing_txid,
+    SUCCESS,
+    FAIL,
 )
 from constants import Sats, TxidStr, RawTxStr
-from typing import List
+from typing import List, Optional
 
 # For use with template transactions.
 BLANK_INPUT = CMutableTxIn
@@ -662,6 +664,35 @@ class CtvTreeExecutor:
         assert txid == tx.GetTxid()[::-1].hex() == self.plan.tovault_txid
 
         return txid
+    
+    def test_vault_op(self, coin: Coin):
+        """
+        Test broadcast of penalizing transaction and vault transaction
+        """
+        print(bold("\n# Testing Transaction Broadcast Status"))
+        print(bold("====================================\n"))   
+        
+        # 1. Check penalizing transaction
+        penalizing_txid = load_penalizing_txid()
+        if penalizing_txid is None:
+            print("No penalizing transaction found")
+            return
+        
+        try:
+            self.rpc.getrawtransaction(penalizing_txid, True)
+            print(bold(SUCCESS) + " Verified broadcast of penalizing transaction in Bitcoin")
+        except JSONRPCError as e:
+            print(bold(FAIL) + " Penalizing transaction not found")
+        
+        # 2. Check vault transaction
+        try:
+            self.rpc.getrawtransaction(self.plan.tovault_txid, True)
+            print(bold(SUCCESS) + " Verified broadcast of vault transaction in Bitcoin")
+        except JSONRPCError as e:
+            print(bold(FAIL) + " Vault transaction not found")
+        
+        print("\n" + bold("===================================="))
+            
 
     def start_unvault(self) -> CTransaction:
         self.log(bold("# Starting unvault"))
@@ -673,6 +704,23 @@ class CtvTreeExecutor:
         self.unvault_outpoint2 = COutPoint(txid_to_bytes(txid), 1)
         return tx
     
+    def test_unvault_op(self, tx: CTransaction):
+        """
+        Test unvault transaction if broadcasted
+        Else verify it has not yet been broadcasted
+        """
+        print(bold("\n# Testing unvault transaction status"))
+        print(bold("====================================\n"))   
+        
+        try:
+            txid = bytes_to_txid(tx.GetTxid())
+            self.rpc.getrawtransaction(txid, True)
+            print(bold(SUCCESS) + " Verified broadcast of unvault transaction in Bitcoin")
+        except JSONRPCError as e:
+            print(bold(SUCCESS) + " Unvault transaction yet to be broadcasted")
+        
+        print("\n" + bold("===================================="))
+    
     def get_tohot_tx(self, output1_privkey, output2_privkey) -> CTransaction:
         output1_addr = self.plan.hot_pubkey.p2wpkh_address(self.rpc.net_name)
         output2_addr = self.plan.cold_pubkey.p2wpkh_address(self.rpc.net_name)
@@ -681,7 +729,29 @@ class CtvTreeExecutor:
         (tx, _) = self._print_signed_tx(self.plan.sign_tohot_tx, output1_privkey, output2_privkey)
         return tx
     
-    def verify_equivocation(self, recipient: str, leaf_index: int):
+    def test_to_children_op(self, tx: CTransaction, parent_txns: List[CTransaction]):
+        print(bold("\n# Testing transaction status"))
+        print(bold("====================================\n"))   
+        
+        # Check parent transactions
+        for parent_tx in parent_txns:
+            try:
+                txid = bytes_to_txid(parent_tx.GetTxid())
+                self.rpc.getrawtransaction(txid, True)
+                print(bold(SUCCESS) + f" Verified broadcast of parent transaction {txid} in Bitcoin")
+            except JSONRPCError as e:
+                print(bold(SUCCESS) + f" Parent transaction {txid} not broadcasted")
+        
+        try:
+            txid = bytes_to_txid(tx.GetTxid())
+            self.rpc.getrawtransaction(txid, True)
+            print(bold(SUCCESS) + " Verified broadcast of transaction in Bitcoin")
+        except JSONRPCError as e:
+            print(bold(SUCCESS) + " Transaction yet to be broadcasted")
+        
+        print("\n" + bold("===================================="))
+    
+    def verify_equivocation(self, recipient: str, leaf_index: int) -> Optional[str]:
         """
         Verify that the transaction has not been double-spent using non-equivocating
         contracts.
@@ -699,6 +769,7 @@ class CtvTreeExecutor:
         if collateral_tx is not None:
             collateral_txid = self.rpc.sendrawtransaction(collateral_tx.serialize().hex())
             print(f"Collateral claimed in transaction: {green(collateral_txid)}")
+            return collateral_txid
             
         return
     
@@ -716,6 +787,51 @@ class CtvTreeExecutor:
         
         (tx, _) = self._print_signed_tx(self.plan.spend_leaf, spender_key, recipient_pubkey, leaf_index)
         return tx
+    
+    def test_spend_leaves_op(self, tx: CTransaction, parent_txns: List[CTransaction], collateral_txid: TxidStr = None):
+        print(bold("\n# Testing transaction status"))
+        print(bold("====================================\n"))   
+        
+        # Check parent transactions
+        for parent_tx in parent_txns:
+            try:
+                txid = bytes_to_txid(parent_tx.GetTxid())
+                self.rpc.getrawtransaction(txid, True)
+                print(bold(SUCCESS) + f" Verified broadcast of parent transaction {txid} in Bitcoin")
+            except JSONRPCError as e:
+                print(bold(SUCCESS) + f" Parent transaction {txid} not broadcasted")
+        
+        try:
+            txid = bytes_to_txid(tx.GetTxid())
+            self.rpc.getrawtransaction(txid, True)
+            print(bold(SUCCESS) + " Verified broadcast of transaction in Bitcoin")
+        except JSONRPCError as e:
+            print(bold(SUCCESS) + " Transaction yet to be broadcasted")
+            
+        
+        # verify penalizing transaction has been spent
+        penalizing_txid = load_penalizing_txid()
+        if penalizing_txid is not None:
+            try:
+                txout = self.rpc.gettxout(penalizing_txid, 0) # Check output 0 from penalizign txn
+                if txout is None:
+                    print(bold(SUCCESS) + f" Output from penalizing transaction {penalizing_txid} has been spent")
+                else:   
+                    print(bold(SUCCESS) + f" Output from penalizing transaction {penalizing_txid} has not been spent")
+            except JSONRPCError as e:
+                print(bold(SUCCESS) + f" Penalizing transaction {penalizing_txid} not broadcasted")
+        
+        # Verify collateral transaction
+        if collateral_txid is not None:
+            try:
+                self.rpc.getrawtransaction(collateral_txid, True)
+                print(bold(SUCCESS) + f" Verified broadcast of collateral transaction {collateral_txid} in Bitcoin")
+            except JSONRPCError as e:
+                print(bold(SUCCESS) + f" Collateral transaction {collateral_txid} not broadcasted")
+        else:
+            print(bold(SUCCESS) + " No collateral transaction to verify")
+        
+        print("\n" + bold("===================================="))
 
     def _print_signed_tx(
         self, signed_txn_fnc, *args, **kwargs

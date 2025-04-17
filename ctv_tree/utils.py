@@ -186,3 +186,7 @@ def clear_penalizing_txid() -> None:
     """Delete the contents of the penalizing txid file."""
     with open(PENALIZING_TXID_FILE, "w") as f:
         f.write("")
+        
+# Test status
+SUCCESS = green("✓") 
+FAIL = red("✗")    

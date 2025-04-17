@@ -36,9 +36,10 @@ def encumber():
     generateblocks(rpc, 10)
     
     c.exec.send_to_vault(c.coin_in, c.from_wallet.privkey)
-
     original_coin_txid = c.coin_in.outpoint.hash[::-1].hex()
     print(bold(f"Coins are vaulted at {original_coin_txid}\n"))
+    
+    c.exec.test_vault_op(c.coin_in)
 
 @cli.cmd
 def unencumber(original_coin_txid: TxidStr):
@@ -54,6 +55,8 @@ def unencumber(original_coin_txid: TxidStr):
     c = CtvTreeScenario.for_demo(original_coin_txid)
     tx = c.exec.start_unvault()
     _broadcast_final(c, tx)
+    
+    c.exec.test_unvault_op(tx)
 
 @cli.cmd
 def to_children(original_coin_txid: TxidStr):
@@ -68,6 +71,8 @@ def to_children(original_coin_txid: TxidStr):
     # Send array of parent txns to broadcast
     parent_txns = [parent_tx]
     _broadcast_final(c, tx, parent_txns)
+    
+    c.exec.test_to_children_op(tx, parent_txns)
 
 @cli.cmd
 def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
@@ -97,13 +102,15 @@ def spend_leaf_outputs(original_coin_txid: TxidStr, leaf_index: int):
     )
     
     # Use non-equivocating contracts to verify that the tx is not double-spent
-    c.exec.verify_equivocation(recipient_name, leaf_index)
+    collateral_txid = c.exec.verify_equivocation(recipient_name, leaf_index)
     
     # Parent transactions to broadcast if not already done
     # NOTE - the order of broadcasting the transactions is important. Start with the top and then move down.
     parent_txns = [c.exec.start_unvault(), c.exec.get_tohot_tx(c.output1_wallet.privkey, c.output2_wallet.privkey)]
     
     _broadcast_final(c, tx, parent_txns)
+    
+    c.exec.test_spend_leaves_op(tx, parent_txns, collateral_txid)
 
 @cli.cmd
 def generate_blocks(n: int):
